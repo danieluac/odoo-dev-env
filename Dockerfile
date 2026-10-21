@@ -43,6 +43,10 @@ USER root
 # Release desse arquivo já expiraram (daí Check-Valid-Until=false) e o
 # serviço limita o débito (daí os retries). As imagens Ubuntu (Odoo 17+)
 # não são tocadas. A data vem do .env (DEBIAN_SNAPSHOT) via build arg.
+#
+# tzdata actualizado e, onde existe (Ubuntu 24.04+), tzdata-legacy: os nomes
+# legados de fusos horários (Canada/*, US/*, …) saíram do tzdata base e o
+# Odoo 18+ precisa de os conseguir abrir (ver scripts/check_image.py).
 ARG DEBIAN_SNAPSHOT=20260901T000000Z
 RUN set -eux; \
     if grep -q '^VERSION_CODENAME=bullseye' /etc/os-release; then \
@@ -59,9 +63,6 @@ RUN set -eux; \
             > /etc/apt/apt.conf.d/99-bullseye-snapshot; \
     fi; \
     apt-get update; \
-    # tzdata actualizado e, onde existe (Ubuntu 24.04+), tzdata-legacy: os
-    # nomes legados de fusos horários (Canada/*, US/*, …) saíram do tzdata
-    # base e o Odoo 18+ precisa de os conseguir abrir (ver scripts/check_image.py)
     apt-get install -y --no-install-recommends build-essential python3-dev unixodbc-dev git tzdata \
         $(apt-cache show tzdata-legacy >/dev/null 2>&1 && echo tzdata-legacy); \
     rm -rf /var/lib/apt/lists/*
@@ -82,13 +83,14 @@ ENV PIP_BREAK_SYSTEM_PACKAGES=1 PIP_ROOT_USER_ACTION=ignore
 # mais recente, em /usr/local, e passa a ser essa que o Odoo importa.
 # lxml-html-clean: a partir do lxml 5.2 o módulo lxml.html.clean (usado pelo
 # Odoo) vive neste pacote separado — é obrigatório em todas as versões.
+# No fim remove-se o pacote PyPI "tzdata" (dependência declarada do pandas,
+# dispensável em Linux): acrescenta ao zoneinfo do Python nomes que o pytz do
+# sistema pode não conseguir abrir → o Odoo 18+ não arranca. Fica só o tzdata
+# do sistema.
 RUN pip3 install --no-cache-dir uv \
     && uv pip install --system --break-system-packages --no-cache \
         -r /tmp/requirements.txt watchdog lxml-html-clean \
         "openupgradelib @ git+https://github.com/OCA/openupgradelib.git@master" \
-    # o pacote PyPI "tzdata" (dependência declarada do pandas, dispensável em
-    # Linux) acrescenta ao zoneinfo do Python nomes que o pytz do sistema pode
-    # não conseguir abrir → o Odoo 18+ não arranca. Fica só o tzdata do sistema.
     && (uv pip uninstall --system --break-system-packages tzdata || true)
 
 # Todas as versões: o requirements arrasta um cryptography recente, com o
@@ -145,15 +147,15 @@ RUN set -u; R=/tmp/requirements.addons.txt; UV="uv pip install --system --break-
 
 # As dependências dos repos podem voltar a mexer nestas bibliotecas;
 # repõe-se o que a fase base garante (pyOpenSSL compatível com o
-# cryptography instalado; no Odoo 16 também urllib3<2 e lxml<6).
+# cryptography instalado; no Odoo 16 também urllib3<2 e lxml<6) e
+# remove-se outra vez o pacote PyPI tzdata, caso uma dependência dos repos
+# o tenha trazido (ver scripts/check_image.py).
 ARG ODOO_VERSION
 RUN uv pip install --system --break-system-packages --no-cache "pyOpenSSL>=24.2" \
     && if [ "${ODOO_VERSION%%.*}" = "16" ]; then \
         uv pip install --system --break-system-packages --no-cache \
             "urllib3>=1.26.16,<2" "lxml>=5.2,<6"; \
     fi \
-    # idem fase base: uma dependência dos repos pode ter voltado a trazer o
-    # pacote PyPI tzdata (ver scripts/check_image.py)
     && (uv pip uninstall --system --break-system-packages tzdata || true)
 
 # Verificação no fim do build (imports + fusos horários): se alguma
