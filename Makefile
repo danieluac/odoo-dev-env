@@ -1,0 +1,910 @@
+# ═════════════════════════════════════════════════════════════════════
+# Odoo · Ambiente Docker — interface única: make
+#
+# Quem não sabe Docker só precisa disto:
+#
+#     make up                              # sobe o ambiente (Odoo + Postgres)
+#     make backup                          # backup da BD activa (com filestore)
+#     make restore FILE=backups/prod.zip   # restaura um backup (fica a BD activa)
+#     make help                            # todos os comandos
+#
+# TODA a configuração (versão do Odoo, porta, credenciais…) vem do .env —
+# criado automaticamente a partir do .env.example na 1ª execução e nunca
+# sobrescrito. A versão do Odoo é perguntada no 1º `make up` (ou dada com
+# `make up ODOO_VERSION=18.0`) e fica gravada no .env; para mudar, edita
+# ODOO_VERSION lá e corre `make up` (cada versão tem containers/volumes/BDs
+# isolados). O mesmo código serve todas as versões suportadas.
+# ═════════════════════════════════════════════════════════════════════
+
+SHELL := /bin/bash
+# -e: cada receita falha à primeira falha — usar `|| true` onde a falha é aceitável
+.SHELLFLAGS := -ec
+.ONESHELL:
+.DEFAULT_GOAL := help
+
+ROOT_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
+ENV_FILE := $(ROOT_DIR)/.env
+comma := ,
+
+# env(KEY) — lê uma variável do .env (a ÚNICA fonte de configuração).
+# Recursivo (avaliado só quando usado, já depois do `init` criar o .env).
+env = $(strip $(shell [ -f $(ENV_FILE) ] && sed -nE 's/^[[:space:]]*$(1)[[:space:]]*=[[:space:]]*//p' $(ENV_FILE) | tail -1))
+
+# ── Configuração (tudo vem do .env) ──────────────────────────────────
+# Versões do Odoo que este setup suporta (imagens base publicadas, defaults
+# do PostgreSQL, flags de demo…). A versão em uso é escolhida uma vez, no
+# primeiro `make up` (ver `init`), e gravada em ODOO_VERSION no .env.
+SUPPORTED_VERSIONS := 16.0 17.0 18.0 19.0 20.0
+# _V: override INTERNO da versão (usado pelo make migrate para operar noutro
+# projecto compose sem tocar no .env) — não é para uso na linha de comando.
+_V              ?=
+ODOO_VERSION     = $(or $(_V),$(call env,ODOO_VERSION))
+ODOO_MAJOR       = $(firstword $(subst ., ,$(ODOO_VERSION)))
+# ODOO_VERSION=<v> na linha de comando só serve para o 1º arranque (o init
+# grava-a no .env); depois disso a versão vem sempre do .env.
+CLI_VERSION     := $(if $(filter command line,$(origin ODOO_VERSION)),$(ODOO_VERSION),)
+# PostgreSQL por omissão = mínimo exigido pela versão do Odoo (16/17 → 15,
+# 18 → 16, 19/20 → 17). POSTGRES_VERSION no .env, se preenchido, sobrepõe-se.
+PG_DEFAULT       = $(if $(filter 16 17,$(ODOO_MAJOR)),15,$(if $(filter 18,$(ODOO_MAJOR)),16,17))
+POSTGRES_VERSION = $(or $(call env,POSTGRES_VERSION),$(PG_DEFAULT))
+ODOO_PORT        = $(call env,ODOO_PORT)
+PGUSER           = $(call env,POSTGRES_USER)
+ENTERPRISE_DIR   = $(call env,ENTERPRISE_DIR)
+
+# ── Imagem base (BASE_IMAGE no .env) ─────────────────────────────────
+# A fase "base" do Dockerfile é publicada no GHCR a cada release, uma por
+# versão do Odoo. Por omissão o build local parte dela (rápido) e só
+# acrescenta as dependências dos repos de módulos. Se não estiver acessível,
+# o alvo _base-image devolve "base" = construir tudo localmente a partir da
+# imagem oficial. BASE_IMAGE=local força o build local; outro valor = outra
+# imagem/registo.
+IMAGE_REPO     := ghcr.io/danieluac/odoo-dev-env
+BASE_IMAGE_CFG  = $(call env,BASE_IMAGE)
+BASE_IMAGE      = $(if $(BASE_IMAGE_CFG),$(BASE_IMAGE_CFG),$(IMAGE_REPO):$(ODOO_VERSION))
+
+# ── Dados de demonstração (ODOO_DEMO no .env; só afecta BDs novas e instalações) ──
+# Até à 18 o Odoo carrega demo por omissão (--without-demo=all desliga);
+# a partir da 19 não carrega (--with-demo liga). A flag certa para a versão:
+ODOO_DEMO   = $(call env,ODOO_DEMO)
+_DEMO_NEWCLI = $(filter 19 2% 3%,$(ODOO_MAJOR))
+DEMO_FLAG   = $(if $(filter 1,$(ODOO_DEMO)),$(if $(_DEMO_NEWCLI),--with-demo,),$(if $(_DEMO_NEWCLI),,--without-demo=all))
+DEMO_LABEL  = $(if $(filter 1,$(ODOO_DEMO)),com dados de demonstração,sem dados de demonstração)
+
+# ── Edição: Enterprise se o módulo web_enterprise existir em ENTERPRISE_DIR ou
+# em qualquer pasta de addons (addons/, repos/, ADDONS_PATHS). Nesse caso as
+# BDs novas são criadas já com web_enterprise instalado.
+ENTERPRISE_ABS   = $(if $(ENTERPRISE_DIR),$(call addons_abs,$(ENTERPRISE_DIR)),)
+ENTERPRISE_FOUND = $(firstword $(wildcard $(foreach d,$(ENTERPRISE_ABS) $(foreach m,$(ADDONS_MAP),$(firstword $(subst =,$(space),$(m)))),$(d)/web_enterprise/__manifest__.py)))
+EDITION      = $(if $(ENTERPRISE_FOUND),Enterprise,Community)
+INIT_MODULES = base$(if $(ENTERPRISE_FOUND),$(comma)web_enterprise,)
+BACKUP_RAW       = $(call env,BACKUP_DIR)
+BACKUP_ABS       = $(if $(filter /%,$(BACKUP_RAW)),$(BACKUP_RAW),$(abspath $(ROOT_DIR)/$(if $(BACKUP_RAW),$(BACKUP_RAW),backups)))
+
+# ── Módulos de outros repositórios (sem tocar em ficheiros versionados) ──
+# Duas formas, que podem coexistir:
+#
+#  1. repos/ — pasta IGNORADA pelo git dentro do setup. Clona lá os repos de
+#     módulos (qualquer estrutura interna). Toda a pasta é montada em
+#     /mnt/repos e cada pasta que contenha módulos (uma pasta com
+#     __manifest__.py lá dentro) é descoberta automaticamente e entra no
+#     addons_path. Não precisa de configuração nenhuma.
+#
+#  2. ADDONS_PATHS no .env — lista separada por vírgula de pastas de addons
+#     FORA do setup (absolutas, ~/… ou relativas à raiz do repo). Cada uma é
+#     montada em /mnt/addons/<nome> por um override de compose gerado.
+#
+# Ordem no addons_path: enterprise, addons/, repos/ (alfabética), ADDONS_PATHS
+# (pela ordem do .env).
+empty :=
+space := $(empty) $(empty)
+REPOS_DIR := $(ROOT_DIR)/repos
+# pastas de addons dentro de repos/: pais das pastas de módulo (host, absolutas)
+# (ignora .git, node_modules e a pasta setup/ dos repos OCA, que só tem symlinks)
+REPOS_ADDONS := $(sort $(shell [ -d $(REPOS_DIR) ] && find $(REPOS_DIR) -maxdepth 8 -name __manifest__.py -not -path '*/.git/*' -not -path '*/node_modules/*' -not -path '$(REPOS_DIR)/*/setup/*' 2>/dev/null | sed -E 's#/[^/]+/__manifest__\.py$$##' | sort -u))
+repos_mnt = $(patsubst $(REPOS_DIR)%,/mnt/repos%,$(1))
+
+ADDONS_PATHS = $(strip $(subst $(comma),$(space),$(call env,ADDONS_PATHS)))
+# caminho absoluto no host (aceita ~/, absoluto ou relativo à raiz do repo)
+addons_abs  = $(abspath $(if $(filter /%,$(1)),$(1),$(if $(filter ~/%,$(1)),$(HOME)/$(patsubst ~/%,%,$(1)),$(ROOT_DIR)/$(1))))
+_bn = $(notdir $(call addons_abs,$(1)))
+_pn = $(notdir $(patsubst %/,%,$(dir $(call addons_abs,$(1)))))
+_ALL_BN = $(foreach p,$(ADDONS_PATHS),$(call _bn,$(p)))
+# nome do mount: o nome da pasta; se duas pastas tiverem o mesmo nome
+# (ex.: a/addons e b/addons), usa <pai>-<pasta> para as distinguir
+addons_name = $(if $(filter-out 1,$(words $(filter $(call _bn,$(1)),$(_ALL_BN)))),$(call _pn,$(1))-$(call _bn,$(1)),$(call _bn,$(1)))
+addons_mnt  = /mnt/addons/$(call addons_name,$(1))
+ADDONS_NAMES = $(foreach p,$(ADDONS_PATHS),$(call addons_name,$(p)))
+ADDONS_COMPOSE = $(ROOT_DIR)/config/docker-compose.addons.yml
+# requirements.txt dos repos de módulos → agregados em config/requirements.addons.txt,
+# que o Dockerfile instala no build (make up reconstrói a imagem quando mudam).
+# Em repos/ e addons/: todos os requirements.txt. Em cada pasta de ADDONS_PATHS:
+# o da própria pasta e os das pastas-mãe até à raiz do repo git (é aí que
+# normalmente está).
+ADDONS_REQ = $(ROOT_DIR)/config/requirements.addons.txt
+REPOS_REQ := $(sort $(shell find $(ROOT_DIR)/addons $(REPOS_DIR) -maxdepth 8 -name requirements.txt -not -path '*/.git/*' -not -path '*/node_modules/*' -not -path '*/venv/*' -not -path '*/.venv/*' -not -path '$(REPOS_DIR)/*/setup/*' 2>/dev/null))
+# Pacotes que NÃO existem no PyPI — só como pacotes do sistema Ubuntu/Debian.
+# Aparecem em requirements.txt feitos com `pip freeze` no Python do sistema e
+# fariam o build falhar. São retirados da agregação (ficam como comentário
+# "# ignorado:"). Acrescenta outros em ADDONS_REQUIREMENTS_IGNORE no .env.
+REQ_IGNORE_BUILTIN := apturl command-not-found python-apt ubuntu-drivers-common \
+  ubuntu-pro-client ubuntu-advantage-tools unattended-upgrades language-selector \
+  screen-resolution-extra xkit usb-creator cupshelpers defer louis brlapi \
+  systemd-python ufw distro-info apt-xapian-index reportbug python-xapian \
+  nvidia-ml-py3 blinker-compat
+REQ_IGNORE = $(REQ_IGNORE_BUILTIN) $(subst $(comma),$(space),$(call env,ADDONS_REQUIREMENTS_IGNORE))
+
+# pares host=container de TODAS as pastas de addons (addons/ do repo primeiro)
+ADDONS_MAP = $(ROOT_DIR)/addons=/mnt/extra-addons \
+  $(foreach p,$(REPOS_ADDONS),$(p)=$(call repos_mnt,$(p))) \
+  $(foreach p,$(ADDONS_PATHS),$(call addons_abs,$(p))=$(call addons_mnt,$(p)))
+# addons_path (lado container) pela ordem de prioridade do Odoo
+ADDONS_PATH_CE = $(subst $(space),,$(foreach m,$(ADDONS_MAP),$(comma)$(lastword $(subst =,$(space),$(m)))))
+ADDONS_PATH    = $(if $(ENTERPRISE_DIR),/mnt/enterprise$(ADDONS_PATH_CE),$(patsubst $(comma)%,%,$(ADDONS_PATH_CE)))
+# pathMappings do VS Code: repos/ inteira num só mapeamento
+LAUNCH_MAP = $(ROOT_DIR)/addons=/mnt/extra-addons $(REPOS_DIR)=/mnt/repos \
+  $(foreach p,$(ADDONS_PATHS),$(call addons_abs,$(p))=$(call addons_mnt,$(p)))
+
+# ── Parâmetros por comando (argumentos, não configuração) ────────────
+FILE       ?=
+MODULE     ?=
+# scaffold: pasta de addons de destino (default: addons/ do repo)
+IN         ?=
+FILESTORE  ?= 1
+NEUTRALIZE ?= 1
+# migração: TO=<versão destino>, FROM=<versão origem> (default: a do .env)
+TO         ?=
+FROM       ?=
+SWITCH     ?= 0
+MODE       ?= test
+# internos (usados pelo make migrate nas chamadas recursivas)
+RESTORE_START ?= 1
+BACKUP_NAME   ?=
+OPENUPGRADE_REPO ?= https://github.com/OCA/OpenUpgrade.git
+MIGRATIONS_DIR   := $(ROOT_DIR)/migrations
+DB_FROM_CLI := $(if $(filter command line,$(origin DB)),1,)
+# BD alvo: DB=<nome> na CLI > derivada do FILE (restore) > ODOO_DB do .env
+ifneq ($(origin DB),command line)
+DB = $(or $(if $(FILE),$(basename $(notdir $(FILE)))),$(call env,ODOO_DB))
+endif
+
+# ── docker compose: um projecto por versão (e por INSTANCE) → ambientes isolados ──
+# odoo-<versão>[-<INSTANCE>]: sem INSTANCE, dois clones deste repo com a mesma
+# versão partilhariam o projecto e o `make up` de um recriava os containers do outro.
+INSTANCE = $(call env,INSTANCE)
+PROJECT  = odoo-$(subst .,-,$(ODOO_VERSION))$(if $(INSTANCE),-$(INSTANCE),)
+COMPOSE_FILES = -f $(ROOT_DIR)/docker-compose.yml \
+  $(if $(filter 1,$(call env,PG_TUNING)),-f $(ROOT_DIR)/docker-compose.pg-tuning.yml,) \
+  $(if $(ENTERPRISE_DIR),-f $(ROOT_DIR)/docker-compose.enterprise.yml,) \
+  $(if $(call env,POSTGRES_PORT),-f $(ROOT_DIR)/docker-compose.db-port.yml,) \
+  $(if $(ADDONS_PATHS),-f $(ADDONS_COMPOSE),)
+# ODOO_VERSION/POSTGRES_VERSION passados no ambiente: o compose lê o .env,
+# mas uma variável de ambiente tem precedência — assim o override interno _V
+# e o PostgreSQL derivado da versão chegam ao compose.
+COMPOSE  = ODOO_VERSION=$(ODOO_VERSION) POSTGRES_VERSION=$(POSTGRES_VERSION) docker compose --project-directory $(ROOT_DIR) -p $(PROJECT) $(COMPOSE_FILES)
+EXEC_DB  = $(COMPOSE) exec -T db
+PSQL     = $(EXEC_DB) psql -U $(PGUSER)
+# one-off: container descartável do serviço odoo (não mexe no servidor)
+RUN_ODOO = $(COMPOSE) run --rm -T --no-deps odoo
+
+# ── Cores ────────────────────────────────────────────────────────────
+C_CYAN  := \033[0;36m
+C_GREEN := \033[0;32m
+C_YELL  := \033[0;33m
+C_RED   := \033[0;31m
+C_BOLD  := \033[1m
+C_DIM   := \033[2m
+C_RESET := \033[0m
+
+# ═════════════════════════════════════════════════════════════════════
+# Help
+# ═════════════════════════════════════════════════════════════════════
+.PHONY: help
+help:  ## Mostra esta ajuda
+	@printf "$(C_BOLD)Odoo · ambiente Docker$(C_RESET)  $(C_DIM)(versão: $(if $(ODOO_VERSION),$(ODOO_VERSION),— corre make up) · BD activa: $(if $(DB),$(DB),—))$(C_RESET)\n\n"
+	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_.%-]+:.*?## / { \
+		printf "  $(C_CYAN)%-14s$(C_RESET) %s\n", $$1, $$2 \
+	}' $(MAKEFILE_LIST)
+	@printf "\n$(C_DIM)Parâmetros:$(C_RESET) DB=<nome>  FILE=<backup>  MODULE=<a,b,c>  FILESTORE=0  NEUTRALIZE=0\n"
+	@printf "$(C_DIM)Exemplos:$(C_RESET)\n"
+	@printf "  make up                                # sobe tudo (1ª vez pergunta a versão do Odoo, cria o .env e demora mais)\n"
+	@printf "  make up ODOO_VERSION=18.0              # 1ª vez sem perguntar (versões: $(SUPPORTED_VERSIONS))\n"
+	@printf "  make backup                            # backup da BD activa com filestore → backups/\n"
+	@printf "  make backup DB=outra FILESTORE=0       # backup doutra BD, sem filestore\n"
+	@printf "  make restore FILE=backups/prod.zip     # restaura; a BD 'prod' fica activa\n"
+	@printf "  make scaffold MODULE=minha_app         # cria a estrutura de um módulo novo em addons/ (IN=<pasta> noutra)\n"
+	@printf "  make migrate DB=prod TO=17.0           # migra a BD 'prod' da versão actual para a 17.0 (OpenUpgrade)\n"
+	@printf "  make migrate-module MODULE=x TO=18.0   # migra o código do módulo x para a 18.0 (semi-automático)\n"
+	@printf "  make debug                             # sobe com debugpy em :5678 (attach do VS Code)\n"
+	@printf "\n$(C_DIM)Configuração (versão do Odoo, porta, credenciais, pastas de addons…): edita o .env e corre make up$(C_RESET)\n"
+
+# ═════════════════════════════════════════════════════════════════════
+# Pré-requisitos e ficheiros gerados
+# ═════════════════════════════════════════════════════════════════════
+.PHONY: guard
+guard:
+	@command -v docker >/dev/null 2>&1 || { printf "$(C_RED)✗ Docker não está instalado$(C_RESET) — instala em https://docs.docker.com/get-docker/\n"; exit 1; }
+	docker info >/dev/null 2>&1 || { printf "$(C_RED)✗ o Docker não está a correr$(C_RESET) — abre o Docker Desktop (ou: sudo systemctl start docker)\n"; exit 1; }
+	docker compose version >/dev/null 2>&1 || { printf "$(C_RED)✗ falta o Docker Compose v2$(C_RESET) — vem incluído no Docker Desktop / plugin docker-compose-v2\n"; exit 1; }
+
+.PHONY: init
+init:  ## Cria o .env (a partir do .env.example) e as pastas — idempotente
+	@if [ ! -f $(ENV_FILE) ]; then
+		cp $(ROOT_DIR)/.env.example $(ENV_FILE)
+		printf "$(C_GREEN)✓ .env criado a partir do .env.example$(C_RESET) $(C_DIM)(edita-o para mudar versão/porta/credenciais — nunca é sobrescrito)$(C_RESET)\n"
+	fi
+	# versão do Odoo: escolhida uma vez (pergunta, ou ODOO_VERSION=<v> na linha
+	# de comando) e gravada no .env; a partir daí vem sempre de lá
+	cur="$(call env,ODOO_VERSION)"
+	if [ -n "$(CLI_VERSION)" ] && [ -n "$$cur" ] && [ "$$cur" != "$(CLI_VERSION)" ]; then
+		printf "$(C_RED)✗ este ambiente é o do Odoo $$cur$(C_RESET) $(C_DIM)— para mudar de versão edita ODOO_VERSION no .env e corre make up (cada versão fica num ambiente isolado)$(C_RESET)\n"
+		exit 1
+	fi
+	if [ -z "$$cur" ]; then
+		v="$(CLI_VERSION)"
+		if [ -z "$$v" ]; then
+			if [ -t 0 ]; then
+				printf "$(C_BOLD)Que versão do Odoo queres neste ambiente?$(C_RESET) $(C_DIM)(fica gravada em ODOO_VERSION no .env)$(C_RESET)\n"
+				printf "  versões suportadas: $(C_CYAN)$(SUPPORTED_VERSIONS)$(C_RESET)\n"
+				read -r -p "Versão do Odoo: " v
+			else
+				printf "$(C_RED)✗ versão do Odoo não definida$(C_RESET) — corre: make up ODOO_VERSION=<versão> $(C_DIM)(suportadas: $(SUPPORTED_VERSIONS))$(C_RESET) ou preenche ODOO_VERSION no .env\n"
+				exit 1
+			fi
+		fi
+		case "$$v" in [0-9]|[0-9][0-9]) v="$$v.0";; esac
+		echo " $(SUPPORTED_VERSIONS) " | grep -q " $$v " || { printf "$(C_RED)✗ versão '$$v' não suportada$(C_RESET) — usa uma de: $(SUPPORTED_VERSIONS)\n"; exit 1; }
+		$(MAKE) --no-print-directory _set-env KEY=ODOO_VERSION VAL="$$v"
+	fi
+	mkdir -p $(ROOT_DIR)/addons $(ROOT_DIR)/config $(ROOT_DIR)/backups $(ROOT_DIR)/repos
+	# override de compose com as pastas ADDONS_PATHS (gerado aqui, no init, para
+	# que TODOS os comandos — down, status, logs… — vejam os mesmos mounts)
+	if [ -n "$(ADDONS_PATHS)" ]; then
+		echo "$$ADDONS_COMPOSE_CONTENT" > $(ADDONS_COMPOSE)
+	else
+		rm -f $(ADDONS_COMPOSE)
+	fi
+	# dependências python dos repos de módulos → config/requirements.addons.txt
+	# (sempre gerado, mesmo vazio: o Dockerfile faz COPY dele)
+	req_up() {
+		d="$$1"; n=0
+		while :; do
+			[ -f "$$d/requirements.txt" ] && echo "$$d/requirements.txt"
+			n=$$((n+1))
+			if [ -e "$$d/.git" ] || [ "$$d" = "/" ] || [ "$$d" = "$$HOME" ] || [ "$$d" = "$(ROOT_DIR)" ] || [ $$n -ge 6 ]; then break; fi
+			d="$$(dirname "$$d")"
+		done
+	}
+	{
+		echo "# GERADO automaticamente pelo make — NÃO editar."
+		echo "# Junta os requirements.txt encontrados nas pastas de módulos (addons/, repos/,"
+		echo "# ADDONS_PATHS). Instalado na imagem pelo Dockerfile; make up reconstrói quando muda."
+		{ for f in $(REPOS_REQ); do echo "$$f"; done
+		  for p in $(foreach p,$(ADDONS_PATHS),$(call addons_abs,$(p))); do req_up "$$p"; done
+		} | awk '!seen[$$0]++' | while read -r f; do
+			echo; echo "# --- $$f"
+			# nome do pacote normalizado (minúsculas, _→-) comparado com a lista a ignorar
+			grep -vE '^[[:space:]]*(#|$$)' "$$f" | awk -v ign=" $$(echo '$(REQ_IGNORE)' | tr 'A-Z_' 'a-z-') " '{
+				n=$$0; sub(/^[[:space:]]+/,"",n); sub(/[[:space:]]*([=<>!~;@\[ ].*)?$$/,"",n); gsub(/_/,"-",n); n=tolower(n)
+				if (n != "" && index(ign, " " n " ")) print "# ignorado: " $$0; else print
+			}' || true
+		done
+	} > $(ADDONS_REQ).tmp
+	# só substitui se mudou (evita invalidar a cache do build sem necessidade)
+	if ! cmp -s $(ADDONS_REQ).tmp $(ADDONS_REQ) 2>/dev/null; then mv $(ADDONS_REQ).tmp $(ADDONS_REQ); else rm -f $(ADDONS_REQ).tmp; fi
+
+# valida que as variáveis obrigatórias existem e não estão vazias no .env
+.PHONY: check-env
+check-env: init
+	@missing=0
+	# cada pasta de ADDONS_PATHS tem de existir (senão o Docker montava uma
+	# pasta vazia e os módulos "desapareciam" sem erro)
+	for m in $(ADDONS_MAP); do
+		h="$${m%%=*}"
+		[ -d "$$h" ] || { printf "$(C_RED)✗ pasta de addons não existe: $$h$(C_RESET) $(C_DIM)(ADDONS_PATHS no .env)$(C_RESET)\n"; missing=1; }
+	done
+	[ "$(words $(sort $(ADDONS_NAMES)))" = "$(words $(ADDONS_NAMES))" ] || { printf "$(C_RED)✗ ADDONS_PATHS tem pastas com o mesmo nome e a mesma pasta-mãe — renomeia uma$(C_RESET)\n"; missing=1; }
+	for v in ODOO_VERSION ODOO_PORT ODOO_DB POSTGRES_USER POSTGRES_PASSWORD ADMIN_PASSWD ODOO_LOG ODOO_DEV ODOO_DEBUG_PORT; do
+		if ! grep -qE "^[[:space:]]*$$v[[:space:]]*=[[:space:]]*[^[:space:]]" $(ENV_FILE); then
+			printf "$(C_RED)✗ variável $$v em falta ou vazia no .env$(C_RESET)\n"
+			missing=1
+		fi
+	done
+	[ $$missing -eq 0 ] || { printf "$(C_DIM)  compara o teu .env com o .env.example$(C_RESET)\n"; exit 1; }
+	echo " $(SUPPORTED_VERSIONS) " | grep -q " $(ODOO_VERSION) " || { printf "$(C_RED)✗ ODOO_VERSION=$(ODOO_VERSION) não é suportada$(C_RESET) — usa uma de: $(SUPPORTED_VERSIONS)\n"; exit 1; }
+	echo "$(POSTGRES_VERSION)" | grep -qE '^[0-9]+$$' || { printf "$(C_RED)✗ POSTGRES_VERSION inválido no .env ('$(POSTGRES_VERSION)'): só o número major (ex.: 16) ou vazio$(C_RESET)\n"; exit 1; }
+	inst="$(call env,INSTANCE)"
+	echo "$$inst" | grep -qE '^[a-z0-9_-]*$$' || { printf "$(C_RED)✗ INSTANCE inválido no .env ('$$inst'): usa só minúsculas, dígitos, - e _$(C_RESET)\n"; exit 1; }
+	echo "$(ODOO_DEMO)" | grep -qE '^[01]?$$' || { printf "$(C_RED)✗ ODOO_DEMO inválido no .env ('$(ODOO_DEMO)'): usa 0 ou 1$(C_RESET)\n"; exit 1; }
+	if [ -n "$(ENTERPRISE_DIR)" ] && [ ! -f "$(ENTERPRISE_ABS)/web_enterprise/__manifest__.py" ]; then
+		printf "$(C_YELL)! ENTERPRISE_DIR=$(ENTERPRISE_DIR) não contém o módulo web_enterprise — confirma o caminho (e a versão) dos addons Enterprise$(C_RESET)\n"
+	fi
+
+# impede que este clone tome conta de um projecto compose já usado por OUTRA
+# pasta (mesma versão sem INSTANCE) — o `up` recriaria os containers dela
+.PHONY: _check-project
+_check-project: guard check-env
+	@cid=$$($(COMPOSE) ps -aq 2>/dev/null | head -1)
+	if [ -n "$$cid" ]; then
+		owner=$$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' "$$cid" 2>/dev/null || true)
+		if [ -n "$$owner" ] && [ "$$owner" != "$(ROOT_DIR)" ]; then
+			printf "$(C_RED)✗ o projecto Docker '$(PROJECT)' já pertence a outra pasta:$(C_RESET) $$owner\n"
+			printf "$(C_YELL)  continuar iria recriar (matar) os containers desse ambiente.$(C_RESET)\n"
+			printf "$(C_YELL)  Para ter os dois a correr: no .env desta pasta define INSTANCE=<nome> e uma ODOO_PORT diferente.$(C_RESET)\n"
+			exit 1
+		fi
+	fi
+
+# ── Templates do make scaffold (placeholders @X@ substituídos na receita) ──
+define SCAFFOLD_MANIFEST
+{
+    'name': '@TITLE@',
+    'summary': 'Resumo curto do que o módulo faz',
+    'description': """
+Descrição longa do módulo @MODULE@.
+""",
+    'author': '@AUTHOR@',
+    'website': '@WEBSITE@',
+    'contributors': [@CONTRIB@],
+    'category': 'Uncategorized',
+    'version': '@VERSION@',
+    'license': 'LGPL-3',
+    'depends': ['base'],
+    'data': [
+        'security/ir.model.access.csv',
+        'views/views.xml',
+    ],
+    'application': False,
+    'installable': True,
+}
+endef
+export SCAFFOLD_MANIFEST
+
+define SCAFFOLD_MODELS
+from odoo import models, fields  # noqa: F401
+
+
+# Exemplo de modelo — descomenta e adapta:
+#
+# class @CLASS@(models.Model):
+#     _name = '@MODULE@.@MODULE@'
+#     _description = '@TITLE@'
+#
+#     name = fields.Char(string='Nome', required=True)
+endef
+export SCAFFOLD_MODELS
+
+define SCAFFOLD_VIEWS
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <!-- Vistas, menus e acções do módulo @MODULE@.
+         Exemplo de acção + menu (descomenta e adapta):
+
+    <record id="action_@MODULE@" model="ir.actions.act_window">
+        <field name="name">@TITLE@</field>
+        <field name="res_model">@MODULE@.@MODULE@</field>
+        <field name="view_mode">tree,form</field>
+    </record>
+    <menuitem id="menu_@MODULE@" name="@TITLE@" action="action_@MODULE@"/>
+    -->
+</odoo>
+endef
+export SCAFFOLD_VIEWS
+
+define SCAFFOLD_README
+# @TITLE@
+
+Descrição do módulo @MODULE@.
+
+Instalação no ambiente: `make install MODULE=@MODULE@`
+endef
+export SCAFFOLD_README
+
+# odoo.conf — derivado do .env, regenerado em cada make up (não editar)
+define ODOO_CONF_CONTENT
+# GERADO automaticamente pelo make a partir do .env — NÃO editar aqui.
+# Para mudar a configuração: edita o .env e corre `make up`.
+[options]
+admin_passwd = $(call env,ADMIN_PASSWD)
+db_host = db
+db_port = 5432
+db_user = $(call env,POSTGRES_USER)
+db_password = $(call env,POSTGRES_PASSWORD)
+addons_path = $(ADDONS_PATH)
+data_dir = /var/lib/odoo
+workers = 0
+max_cron_threads = 1
+limit_time_cpu = 3600
+limit_time_real = 3600
+limit_memory_soft = 2147483648
+limit_memory_hard = 4294967296
+list_db = True
+endef
+export ODOO_CONF_CONTENT
+
+# newline literal (para gerar ficheiros multi-linha com foreach)
+define newline
+
+
+endef
+
+# config/docker-compose.addons.yml — um bind mount por pasta de ADDONS_PATHS.
+# create_host_path:false → se a pasta não existir, falha em vez de montar vazio.
+define ADDONS_COMPOSE_CONTENT
+# GERADO automaticamente pelo make a partir de ADDONS_PATHS no .env — NÃO editar.
+services:
+  odoo:
+    volumes:
+$(subst $(newline)$(space),$(newline),$(foreach p,$(ADDONS_PATHS),      - type: bind$(newline)         source: $(call addons_abs,$(p))$(newline)         target: $(call addons_mnt,$(p))$(newline)         bind:$(newline)           create_host_path: false$(newline)))
+endef
+export ADDONS_COMPOSE_CONTENT
+
+# .vscode/launch.json — attach ao debugpy com um pathMapping por pasta de addons
+define LAUNCH_JSON_CONTENT
+{
+  // GERADO automaticamente pelo make (make up / make conf) — NÃO editar.
+  // Debug Python do Odoo: `make debug` e depois F5 com a configuração "Odoo".
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Odoo",
+      "type": "debugpy",
+      "request": "attach",
+      "connect": { "host": "localhost", "port": $(call env,ODOO_DEBUG_PORT) },
+      "justMyCode": false,
+      "pathMappings": [
+$(subst $(newline)$(space),$(newline),$(foreach m,$(LAUNCH_MAP),        { "localRoot": "$(firstword $(subst =, ,$(m)))", "remoteRoot": "$(lastword $(subst =, ,$(m)))" },$(newline)))]]
+      ]
+    }
+  ]
+}
+endef
+export LAUNCH_JSON_CONTENT
+
+.PHONY: conf
+conf: init
+	@echo "$$ODOO_CONF_CONTENT" > $(ROOT_DIR)/config/odoo.conf
+	mkdir -p $(ROOT_DIR)/.vscode
+	# remove a vírgula do último pathMapping (JSON não aceita vírgula final)
+	echo "$$LAUNCH_JSON_CONTENT" | sed -e ':a' -e 'N' -e '$$!ba' -e 's/},\n\]\]/}/' -e 's/\]\]//' > $(ROOT_DIR)/.vscode/launch.json
+
+# decide a imagem de partida do build e imprime-a (stdout): a publicada no
+# GHCR, se acessível (actualizada com docker pull), senão "base" (build local).
+# Mensagens vão para stderr para não contaminarem o valor.
+.PHONY: _base-image
+_base-image:
+	@if [ "$(BASE_IMAGE)" = "local" ]; then echo base; exit 0; fi
+	# consulta rápida ao registo (só metadados, com limite de tempo) antes do pull
+	reach() { if command -v timeout >/dev/null 2>&1; then timeout 20 docker buildx imagetools inspect "$(BASE_IMAGE)"; else docker buildx imagetools inspect "$(BASE_IMAGE)"; fi; }
+	if reach >/dev/null 2>&1 && docker pull -q "$(BASE_IMAGE)" >/dev/null 2>&1; then
+		echo "$(BASE_IMAGE)"
+	elif docker image inspect "$(BASE_IMAGE)" >/dev/null 2>&1; then
+		printf "$(C_YELL)! não foi possível actualizar $(BASE_IMAGE) (sem rede?) — a usar a cópia local$(C_RESET)\n" >&2
+		echo "$(BASE_IMAGE)"
+	else
+		printf "$(C_YELL)! imagem base $(BASE_IMAGE) não acessível — a construir localmente a partir da imagem oficial (demora mais; BASE_IMAGE=local no .env para não voltar a tentar)$(C_RESET)\n" >&2
+		echo base
+	fi
+
+# constrói odoo-custom:<versão> a partir da imagem base escolhida
+.PHONY: build
+build: guard check-env  ## (Re)constrói a imagem Odoo desta versão (faz-se sozinho no make up)
+	@BASE="$$($(MAKE) --no-print-directory _base-image)"
+	printf "$(C_CYAN)→ a preparar a imagem Odoo $(ODOO_VERSION) $(C_DIM)(base: $$BASE)$(C_RESET)\n"
+	BASE_IMAGE_EFFECTIVE="$$BASE" $(COMPOSE) build odoo
+
+# garante que a imagem odoo-custom:<versão> existe (constrói na 1ª vez)
+.PHONY: ensure-image
+ensure-image: guard check-env
+	@if ! docker image inspect odoo-custom:$(ODOO_VERSION) >/dev/null 2>&1; then
+		printf "$(C_CYAN)→ 1ª utilização da versão $(ODOO_VERSION)$(C_RESET)\n"
+		$(MAKE) --no-print-directory build
+	fi
+
+# ═════════════════════════════════════════════════════════════════════
+# Ambiente
+# ═════════════════════════════════════════════════════════════════════
+.PHONY: up
+up: guard check-env conf _check-project  ## Sobe o ambiente completo (Odoo + Postgres) — 1ª vez demora
+	@$(MAKE) --no-print-directory build
+	printf "$(C_CYAN)→ a subir o Postgres$(C_RESET)\n"
+	$(COMPOSE) up -d --wait db
+	if ! $(PSQL) -d "$(DB)" -tAc "SELECT 1 FROM information_schema.tables WHERE table_name='ir_module_module'" 2>/dev/null | grep -q 1; then
+		printf "$(C_CYAN)→ BD $(DB) não existe — a inicializar em modo $(EDITION), $(DEMO_LABEL) (demora uns minutos)$(C_RESET)\n"
+		$(RUN_ODOO) odoo -d $(DB) -i $(INIT_MODULES) $(DEMO_FLAG) --stop-after-init --log-level warn
+	fi
+	printf "$(C_CYAN)→ a subir o Odoo$(C_RESET)\n"
+	$(COMPOSE) up -d odoo
+	printf "\n$(C_GREEN)✓ ambiente pronto$(C_RESET) → $(C_BOLD)http://localhost:$(ODOO_PORT)$(C_RESET)  (Odoo $(ODOO_VERSION) $(EDITION) · BD: $(DB) · login: admin / admin)\n"
+
+.PHONY: debug
+debug: guard check-env conf ensure-image _check-project  ## Sobe com debugpy à escuta (attach do VS Code, config "Odoo")
+	@printf "$(C_CYAN)→ a subir em modo debug (debugpy em :$(call env,ODOO_DEBUG_PORT), sem auto-reload)$(C_RESET)\n"
+	$(COMPOSE) up -d --wait db
+	ODOO_DEBUG=1 ODOO_DEV=qweb,xml $(COMPOSE) -f $(ROOT_DIR)/docker-compose.debug.yml up -d odoo
+	printf "$(C_GREEN)✓ debugpy à escuta em :$(call env,ODOO_DEBUG_PORT)$(C_RESET) — attach pelo VS Code (F5, config \"Odoo\")\n"
+	printf "$(C_DIM)  nota: o auto-reload fica desligado em debug; make up volta ao modo normal$(C_RESET)\n"
+
+.PHONY: down
+down: guard init  ## Pára o ambiente (os dados persistem nos volumes)
+	@$(COMPOSE) down
+	printf "$(C_GREEN)✓ parado$(C_RESET) (make up para voltar — os dados mantêm-se)\n"
+
+.PHONY: restart
+restart: guard check-env conf  ## Reinicia o servidor Odoo (aplica mudanças do .env)
+	@$(COMPOSE) up -d --force-recreate odoo
+	printf "$(C_GREEN)✓ odoo reiniciado$(C_RESET)\n"
+
+.PHONY: logs
+logs: guard init  ## Segue os logs do Odoo (Ctrl-C para sair)
+	@$(COMPOSE) logs -f --tail=100 odoo
+
+.PHONY: logs-db
+logs-db: guard init  ## Segue os logs do Postgres
+	@$(COMPOSE) logs -f --tail=100 db
+
+.PHONY: status
+status: guard init  ## Estado do ambiente (versão, BD activa, containers)
+	@printf "$(C_BOLD)Ambiente$(C_RESET)\n"
+	printf "  $(C_DIM)Odoo:$(C_RESET)      $(ODOO_VERSION) $(EDITION)$(if $(ENTERPRISE_FOUND), $(C_DIM)(web_enterprise em $(patsubst %/web_enterprise/__manifest__.py,%,$(ENTERPRISE_FOUND)))$(C_RESET),)\n"
+	printf "  $(C_DIM)Demo:$(C_RESET)      $(if $(filter 1,$(ODOO_DEMO)),sim,não) $(C_DIM)(ODOO_DEMO — só BDs novas e make install)$(C_RESET)\n"
+	printf "  $(C_DIM)Imagem:$(C_RESET)    odoo-custom:$(ODOO_VERSION) $(C_DIM)(base: $(if $(filter local,$(BASE_IMAGE)),build local a partir da imagem oficial,$(BASE_IMAGE)$(comma) com fallback para build local))$(C_RESET)\n"
+	printf "  $(C_DIM)Projecto:$(C_RESET)  $(PROJECT) $(C_DIM)(pasta: $(ROOT_DIR))$(C_RESET)\n"
+	printf "  $(C_DIM)BD activa:$(C_RESET) $(call env,ODOO_DB)\n"
+	printf "  $(C_DIM)URL:$(C_RESET)       http://localhost:$(ODOO_PORT)\n"
+	printf "  $(C_DIM)Postgres:$(C_RESET)  $(if $(call env,POSTGRES_PORT),localhost:$(call env,POSTGRES_PORT),só na rede Docker — make psql; POSTGRES_PORT no .env para publicar)\n"
+	printf "\n$(C_BOLD)Pastas de addons$(C_RESET) $(C_DIM)(host → container, pela ordem do addons_path)$(C_RESET)\n"
+	$(if $(ENTERPRISE_DIR),printf "  %s → /mnt/enterprise $(C_DIM)(enterprise)$(C_RESET)\n" "$(ENTERPRISE_DIR)",)
+	for m in $(ADDONS_MAP); do printf "  %s → %s\n" "$${m%%=*}" "$${m#*=}"; done
+	printf "\n$(C_BOLD)Dependências python dos módulos$(C_RESET) $(C_DIM)(requirements.txt instalados na imagem)$(C_RESET)\n"
+	grep '^# --- ' $(ADDONS_REQ) 2>/dev/null | sed 's/^# --- /  /' || true
+	grep -q '^# --- ' $(ADDONS_REQ) 2>/dev/null || printf "  $(C_DIM)(nenhum requirements.txt encontrado)$(C_RESET)\n"
+	printf "\n$(C_BOLD)Containers$(C_RESET)\n"
+	$(COMPOSE) ps
+
+.PHONY: destroy
+destroy: guard check-env  ## APAGA o ambiente da versão actual: containers + volumes + BDs (confirmação)
+	@read -p "Apagar containers e TODOS os dados (BDs + filestore) do Odoo $(ODOO_VERSION)? [y/N] " c
+	[ "$$c" = "y" ] || { echo "abortado"; exit 1; }
+	$(COMPOSE) down -v --remove-orphans
+	printf "$(C_GREEN)✓ ambiente Odoo $(ODOO_VERSION) destruído$(C_RESET) (as outras versões não foram tocadas)\n"
+
+# ═════════════════════════════════════════════════════════════════════
+# Backups
+# ═════════════════════════════════════════════════════════════════════
+.PHONY: backup
+backup: guard check-env conf ensure-image  ## Backup da BD em zip formato Odoo (FILESTORE=0 → sem filestore; DB=<nome> outra BD)
+	@$(COMPOSE) up -d --wait db
+	DBNAME="$(DB)"
+	if [ "$$($(PSQL) -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$$DBNAME'")" != "1" ]; then
+		printf "$(C_RED)✗ a BD $$DBNAME não existe$(C_RESET) (vê as existentes com: make db-list)\n"
+		exit 1
+	fi
+	mkdir -p $(BACKUP_ABS)
+	NAME="$(if $(BACKUP_NAME),$(BACKUP_NAME),$${DBNAME}_$$(date +%Y%m%d_%H%M%S)$(if $(filter 0,$(FILESTORE)),_sem-filestore,).zip)"
+	printf "$(C_CYAN)→ a criar backup $$NAME $(if $(filter 0,$(FILESTORE)),(sem filestore),(com filestore)) — pode demorar$(C_RESET)\n"
+	$(EXEC_DB) pg_dump -U $(PGUSER) --no-owner "$$DBNAME" \
+		| $(COMPOSE) run --rm -T --no-deps --user root \
+			-v $(BACKUP_ABS):/backup \
+			-e BACKUP_UID=$$(id -u) -e BACKUP_GID=$$(id -g) \
+			odoo python3 /mnt/scripts/backup_util.py zip "/backup/$$NAME" "$$DBNAME" "$(FILESTORE)" "$(ODOO_VERSION)" "$(POSTGRES_VERSION)"
+	test $${PIPESTATUS[0]} -eq 0 || { rm -f "$(BACKUP_ABS)/$$NAME"; printf "$(C_RED)✗ pg_dump falhou$(C_RESET)\n"; exit 1; }
+	printf "$(C_GREEN)✓ backup criado:$(C_RESET) $(BACKUP_ABS)/$$NAME ($$(du -h "$(BACKUP_ABS)/$$NAME" | cut -f1))\n"
+	printf "$(C_DIM)  formato zip padrão do Odoo — restaurável com make restore ou pela UI do Odoo$(C_RESET)\n"
+
+.PHONY: backup-list
+backup-list: init  ## Lista os backups existentes
+	@ls -lht $(BACKUP_ABS)/*.zip 2>/dev/null || printf "$(C_DIM)(nenhum backup em $(BACKUP_ABS) — cria um com: make backup)$(C_RESET)\n"
+
+.PHONY: restore
+restore: guard check-env conf  ## Restaura um backup (FILE=<.zip|.sql|.dump> [DB=nome]) — a BD fica activa
+	@test -n "$(FILE)" || { printf "$(C_RED)✗ uso: make restore FILE=backups/<ficheiro>.zip [DB=nome]$(C_RESET)\n"; exit 1; }
+	test -f "$(FILE)" || { printf "$(C_RED)✗ ficheiro não encontrado: $(FILE)$(C_RESET)\n"; exit 1; }
+	$(MAKE) --no-print-directory ensure-image
+	SRC="$$(cd "$$(dirname "$(FILE)")" && pwd)/$$(basename "$(FILE)")"
+	DBNAME="$(DB)"
+	printf "$(C_CYAN)→ restore de $(FILE) para a BD $$DBNAME$(C_RESET)\n"
+	$(COMPOSE) stop odoo 2>/dev/null || true
+	$(COMPOSE) up -d --wait db
+	$(PSQL) -d postgres -q -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='$$DBNAME' AND pid<>pg_backend_pid();" >/dev/null 2>&1 || true
+	$(PSQL) -d postgres -q -c "DROP DATABASE IF EXISTS \"$$DBNAME\";"
+	$(PSQL) -d postgres -q -c "CREATE DATABASE \"$$DBNAME\" OWNER \"$(PGUSER)\";"
+	case "$$SRC" in
+	*.zip)
+		$(COMPOSE) run --rm -T --no-deps -v "$$SRC":/backup.zip:ro odoo python3 /mnt/scripts/backup_util.py check /backup.zip
+		printf "$(C_CYAN)→ a importar dump.sql (streaming — pode demorar)$(C_RESET)\n"
+		$(COMPOSE) run --rm -T --no-deps -v "$$SRC":/backup.zip:ro odoo python3 /mnt/scripts/backup_util.py cat /backup.zip dump.sql \
+			| $(PSQL) -q -d "$$DBNAME" -v ON_ERROR_STOP=0 >/dev/null
+		test $${PIPESTATUS[0]} -eq 0 || { printf "$(C_RED)✗ leitura do zip falhou$(C_RESET)\n"; exit 1; }
+		if $(COMPOSE) run --rm -T --no-deps -v "$$SRC":/backup.zip:ro odoo python3 /mnt/scripts/backup_util.py has-filestore /backup.zip; then
+			printf "$(C_CYAN)→ a repor o filestore$(C_RESET)\n"
+			$(COMPOSE) run --rm -T --no-deps --user root -v "$$SRC":/backup.zip:ro odoo python3 /mnt/scripts/backup_util.py extract-filestore /backup.zip "$$DBNAME"
+		else
+			printf "$(C_DIM)— zip sem filestore (backup só-BD)$(C_RESET)\n"
+		fi
+		;;
+	*.sql)
+		printf "$(C_CYAN)→ a importar $$SRC$(C_RESET)\n"
+		cat "$$SRC" | $(PSQL) -q -d "$$DBNAME" -v ON_ERROR_STOP=0 >/dev/null
+		test $${PIPESTATUS[0]} -eq 0 || { printf "$(C_RED)✗ leitura do .sql falhou$(C_RESET)\n"; exit 1; }
+		;;
+	*.dump)
+		printf "$(C_CYAN)→ a importar $$SRC (pg_restore)$(C_RESET)\n"
+		$(EXEC_DB) pg_restore -U $(PGUSER) -d "$$DBNAME" --no-owner < "$$SRC" || true
+		;;
+	*)
+		printf "$(C_RED)✗ formato não suportado (usa .zip do Odoo, .sql ou .dump)$(C_RESET)\n"
+		exit 1
+		;;
+	esac
+	if [ "$(NEUTRALIZE)" = "1" ]; then
+		printf "$(C_CYAN)→ a neutralizar a BD para dev (crons + email desligados; NEUTRALIZE=0 evita)$(C_RESET)\n"
+		$(PSQL) -d "$$DBNAME" -q -c "UPDATE ir_cron SET active = false;" 2>/dev/null || true
+		$(PSQL) -d "$$DBNAME" -q -c "UPDATE ir_mail_server SET active = false;" 2>/dev/null || true
+		$(PSQL) -d "$$DBNAME" -q -c "UPDATE fetchmail_server SET active = false;" 2>/dev/null || true
+	fi
+	if [ "$(RESTORE_START)" = "1" ]; then
+		$(MAKE) --no-print-directory _set-env KEY=ODOO_DB VAL="$$DBNAME"
+		$(COMPOSE) up -d odoo
+		printf "$(C_GREEN)✓ BD $$DBNAME restaurada e activa$(C_RESET) → http://localhost:$(ODOO_PORT)\n"
+		printf "$(C_DIM)  se o backup vier de outra versão do código: make update MODULE=all$(C_RESET)\n"
+	else
+		printf "$(C_GREEN)✓ BD $$DBNAME restaurada no ambiente Odoo $(ODOO_VERSION)$(C_RESET) $(C_DIM)(servidor não arrancado)$(C_RESET)\n"
+	fi
+
+# grava KEY=VAL no .env (ex.: a BD activa) — sed portável (Linux e macOS)
+.PHONY: _set-env
+_set-env:
+	@if grep -qE '^[[:space:]]*$(KEY)[[:space:]]*=' $(ENV_FILE); then
+		sed -E 's|^[[:space:]]*$(KEY)[[:space:]]*=.*|$(KEY)=$(VAL)|' $(ENV_FILE) > $(ENV_FILE).tmp && mv $(ENV_FILE).tmp $(ENV_FILE)
+	else
+		echo "$(KEY)=$(VAL)" >> $(ENV_FILE)
+	fi
+	printf "$(C_DIM)— $(KEY)=$(VAL) gravado no .env$(C_RESET)\n"
+
+# ═════════════════════════════════════════════════════════════════════
+# Bases de dados
+# ═════════════════════════════════════════════════════════════════════
+.PHONY: db-list
+db-list: guard check-env  ## Lista as bases de dados desta versão
+	@$(COMPOSE) up -d --wait db >/dev/null 2>&1 || $(COMPOSE) up -d --wait db
+	$(PSQL) -d postgres -tAc "SELECT datname FROM pg_database WHERE NOT datistemplate AND datname <> 'postgres' ORDER BY 1"
+
+.PHONY: db-use
+db-use: guard check-env  ## Muda a BD activa (DB=<nome>) sem restaurar nada
+	@test -n "$(DB_FROM_CLI)" || { printf "$(C_RED)✗ uso: make db-use DB=<nome>$(C_RESET)\n"; exit 1; }
+	$(COMPOSE) up -d --wait db
+	if [ "$$($(PSQL) -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$(DB)'")" != "1" ]; then
+		printf "$(C_RED)✗ a BD $(DB) não existe$(C_RESET) (make db-list)\n"
+		exit 1
+	fi
+	$(MAKE) --no-print-directory _set-env KEY=ODOO_DB VAL="$(DB)"
+	$(COMPOSE) up -d odoo
+	printf "$(C_GREEN)✓ BD activa: $(DB)$(C_RESET) → http://localhost:$(ODOO_PORT)\n"
+
+.PHONY: db-drop
+db-drop: guard check-env  ## Apaga uma BD e o seu filestore (DB=<nome>) — pede confirmação
+	@test -n "$(DB_FROM_CLI)" || { printf "$(C_RED)✗ uso: make db-drop DB=<nome>$(C_RESET)\n"; exit 1; }
+	read -p "Apagar DEFINITIVAMENTE a base de dados $(DB)? [y/N] " c
+	[ "$$c" = "y" ] || { echo "abortado"; exit 1; }
+	$(COMPOSE) up -d --wait db
+	if [ "$(DB)" = "$(call env,ODOO_DB)" ]; then
+		$(COMPOSE) stop odoo 2>/dev/null || true
+		printf "$(C_YELL)! estás a apagar a BD activa — depois corre make up (recria) ou make db-use DB=<outra>$(C_RESET)\n"
+	fi
+	$(PSQL) -d postgres -q -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='$(DB)' AND pid<>pg_backend_pid();" >/dev/null 2>&1 || true
+	$(PSQL) -d postgres -q -c "DROP DATABASE IF EXISTS \"$(DB)\";"
+	$(COMPOSE) run --rm -T --no-deps --user root odoo rm -rf /var/lib/odoo/filestore/$(DB) 2>/dev/null || true
+	printf "$(C_GREEN)✓ BD $(DB) apagada$(C_RESET)\n"
+
+.PHONY: psql
+psql: guard check-env  ## Abre um terminal SQL (psql) na BD activa
+	@$(COMPOSE) exec db psql -U $(PGUSER) -d $(DB)
+
+.PHONY: neutralize
+neutralize: guard check-env  ## Desliga crons + servidores de email na BD (seguro para cópias de produção)
+	@$(COMPOSE) up -d --wait db
+	$(PSQL) -d "$(DB)" -q -c "UPDATE ir_cron SET active = false;" 2>/dev/null || true
+	$(PSQL) -d "$(DB)" -q -c "UPDATE ir_mail_server SET active = false;" 2>/dev/null || true
+	$(PSQL) -d "$(DB)" -q -c "UPDATE fetchmail_server SET active = false;" 2>/dev/null || true
+	printf "$(C_GREEN)✓ BD $(DB) neutralizada$(C_RESET) (crons e email desligados)\n"
+
+# ═════════════════════════════════════════════════════════════════════
+# Odoo — módulos e shell
+# ═════════════════════════════════════════════════════════════════════
+.PHONY: shell
+shell: guard check-env  ## Abre o odoo shell na BD activa (o ambiente tem de estar a correr)
+	@$(COMPOSE) exec odoo odoo shell -d $(DB) --no-http
+
+.PHONY: install
+install: guard check-env conf  ## Instala módulo(s): MODULE=a,b,c
+	@test -n "$(MODULE)" || { printf "$(C_RED)✗ uso: make install MODULE=<nome[,nome…]>$(C_RESET)\n"; exit 1; }
+	$(MAKE) --no-print-directory ensure-image
+	$(COMPOSE) up -d --wait db
+	$(RUN_ODOO) odoo -d $(DB) -i $(MODULE) $(DEMO_FLAG) --stop-after-init --log-level info
+	$(COMPOSE) restart odoo 2>/dev/null || true
+	printf "$(C_GREEN)✓ módulo(s) $(MODULE) instalado(s) na BD $(DB)$(C_RESET)\n"
+
+.PHONY: update
+update: guard check-env conf  ## Actualiza módulo(s): MODULE=a,b,c ou MODULE=all
+	@test -n "$(MODULE)" || { printf "$(C_RED)✗ uso: make update MODULE=<nome[,nome…]|all>$(C_RESET)\n"; exit 1; }
+	$(MAKE) --no-print-directory ensure-image
+	$(COMPOSE) up -d --wait db
+	$(RUN_ODOO) odoo -d $(DB) -u $(MODULE) --stop-after-init --log-level info
+	$(COMPOSE) restart odoo 2>/dev/null || true
+	printf "$(C_GREEN)✓ módulo(s) $(MODULE) actualizado(s) na BD $(DB)$(C_RESET)\n"
+
+.PHONY: scaffold
+scaffold: check-env  ## Cria a estrutura de um módulo novo em addons/ (MODULE=nome; IN=<pasta> para outra pasta de addons)
+	@test -n "$(MODULE)" || { printf "$(C_RED)✗ uso: make scaffold MODULE=<nome_do_modulo> [IN=<pasta de addons>]$(C_RESET) $(C_DIM)(minúsculas e _, ex.: minha_app)$(C_RESET)\n"; exit 1; }
+	echo "$(MODULE)" | grep -qE '^[a-z][a-z0-9_]*$$' || { printf "$(C_RED)✗ nome inválido: usa minúsculas, números e _ (ex.: minha_app)$(C_RESET)\n"; exit 1; }
+	BASE="$(if $(IN),$(call addons_abs,$(IN)),$(ROOT_DIR)/addons)"
+	test -d "$$BASE" || { printf "$(C_RED)✗ a pasta IN=$(IN) não existe$(C_RESET)\n"; exit 1; }
+	DIR="$$BASE/$(MODULE)"
+	test ! -e "$$DIR" || { printf "$(C_RED)✗ $$DIR já existe$(C_RESET)\n"; exit 1; }
+	# garante a identidade no .env (acrescenta os defaults se as chaves faltarem,
+	# p.ex. num .env criado por uma versão anterior do setup)
+	for kv in "MODULE_AUTHOR=A Minha Empresa" "MODULE_WEBSITE=https://www.example.com" "MODULE_CONTRIBUTORS="; do
+		k=$${kv%%=*}
+		if ! grep -qE "^[[:space:]]*$$k[[:space:]]*=" $(ENV_FILE); then
+			echo "$$kv" >> $(ENV_FILE)
+			printf "$(C_YELL)! $$k acrescentado ao .env com o valor por omissão — edita-o$(C_RESET)\n"
+		fi
+	done
+	AUTHOR="$$(sed -nE 's/^[[:space:]]*MODULE_AUTHOR[[:space:]]*=[[:space:]]*//p' $(ENV_FILE) | tail -1)"
+	WEBSITE="$$(sed -nE 's/^[[:space:]]*MODULE_WEBSITE[[:space:]]*=[[:space:]]*//p' $(ENV_FILE) | tail -1)"
+	CONTRIB="$$(sed -nE 's/^[[:space:]]*MODULE_CONTRIBUTORS[[:space:]]*=[[:space:]]*//p' $(ENV_FILE) | tail -1)"
+	# "Ana, Rui" → 'Ana', 'Rui' (lista python no manifesto)
+	if [ -n "$$CONTRIB" ]; then
+		CONTRIB_PY="'$$(echo "$$CONTRIB" | sed -E "s/[[:space:]]*,[[:space:]]*/', '/g")'"
+	else
+		CONTRIB_PY=""
+	fi
+	# minha_app → "Minha App" (nome apresentável) e "MinhaApp" (classe python)
+	TITLE="$$(echo "$(MODULE)" | awk -F_ '{for(i=1;i<=NF;i++){$$i=toupper(substr($$i,1,1)) substr($$i,2)}}1')"
+	CLASS="$$(echo "$$TITLE" | tr -d ' ')"
+	VERSION="$(ODOO_VERSION).1.0.0"
+	# substitui os placeholders @X@ dos templates (bash puro — sem problemas de escaping)
+	render() {
+		local t="$$1"
+		t="$${t//@MODULE@/$(MODULE)}"
+		t="$${t//@TITLE@/$$TITLE}"
+		t="$${t//@CLASS@/$$CLASS}"
+		t="$${t//@AUTHOR@/$$AUTHOR}"
+		t="$${t//@WEBSITE@/$$WEBSITE}"
+		t="$${t//@CONTRIB@/$$CONTRIB_PY}"
+		t="$${t//@VERSION@/$$VERSION}"
+		printf '%s\n' "$$t"
+	}
+	mkdir -p "$$DIR/models" "$$DIR/views" "$$DIR/security"
+	render "$$SCAFFOLD_MANIFEST" > "$$DIR/__manifest__.py"
+	echo "from . import models" > "$$DIR/__init__.py"
+	echo "from . import models" > "$$DIR/models/__init__.py"
+	render "$$SCAFFOLD_MODELS" > "$$DIR/models/models.py"
+	render "$$SCAFFOLD_VIEWS" > "$$DIR/views/views.xml"
+	echo "id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink" > "$$DIR/security/ir.model.access.csv"
+	render "$$SCAFFOLD_README" > "$$DIR/README.md"
+	printf "$(C_GREEN)✓ módulo criado em $$DIR$(C_RESET)\n"
+	printf "$(C_DIM)  autor: $$AUTHOR · website: $$WEBSITE · versão: $$VERSION$(C_RESET)\n"
+	printf "$(C_DIM)  próximo passo: make install MODULE=$(MODULE)$(C_RESET)\n"
+	# pasta nova dentro de repos/ → o addons_path muda; avisa se o servidor já corre
+	if [ -n "$(IN)" ] && [ "$${DIR#$(REPOS_DIR)/}" != "$$DIR" ] && ! echo " $(REPOS_ADDONS) " | grep -q " $$BASE "; then
+		printf "$(C_YELL)  nova pasta de addons em repos/ — corre make restart para o servidor a ver$(C_RESET)\n"
+	fi
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Migração de versão
+#
+#   make migrate DB=<bd> TO=<versão>         BD: OpenUpgrade (OCA), Community
+#   make migrate-module MODULE=<m> TO=<v>    código: odoo-module-migrator (OCA)
+#   make migrate-odoo DB=<bd> TO=<versão>    BD: serviço oficial (Enterprise)
+#
+# O Odoo Community não migra BDs entre versões majors sozinho. O OpenUpgrade
+# migra UMA versão de cada vez (16→17→18): para cada passo, restaura a BD no
+# ambiente da versão seguinte e corre `odoo -u all` com os scripts do
+# OpenUpgrade. Os módulos custom instalados na BD TÊM de existir já migrados
+# em addons/ para a versão de destino (make migrate-module) — senão o -u all
+# falha ou deixa-os de fora. Módulos Enterprise não são suportados pelo
+# OpenUpgrade: aí só o serviço oficial (make migrate-odoo).
+# ═════════════════════════════════════════════════════════════════════
+.PHONY: migrate
+migrate: guard check-env  ## Migra uma BD para outra versão via OpenUpgrade (DB=<bd> TO=<versão>; SWITCH=1 activa no fim)
+	@test -n "$(TO)" || { printf "$(C_RED)✗ uso: make migrate DB=<bd> TO=<versão>$(C_RESET) $(C_DIM)(ex.: TO=17.0; FROM=<versão> se não for a do .env)$(C_RESET)\n"; exit 1; }
+	FROM="$(if $(FROM),$(FROM),$(ODOO_VERSION))"
+	DBNAME="$(DB)"
+	for v in "$$FROM" "$(TO)"; do
+		echo "$$v" | grep -qE '^[0-9]+\.0$$' || { printf "$(C_RED)✗ versão inválida: $$v (usa o formato 16.0, 17.0, …)$(C_RESET)\n"; exit 1; }
+	done
+	F=$${FROM%%.*}; T=$$(echo "$(TO)" | cut -d. -f1)
+	[ "$$T" -gt "$$F" ] || { printf "$(C_RED)✗ TO ($(TO)) tem de ser superior a FROM ($$FROM) — o OpenUpgrade não faz downgrade$(C_RESET)\n"; exit 1; }
+	[ "$$F" -ge 14 ] || { printf "$(C_RED)✗ este fluxo (scripts OpenUpgrade sobre o Odoo oficial) só existe a partir da 14.0$(C_RESET)\n"; exit 1; }
+	command -v git >/dev/null 2>&1 || { printf "$(C_RED)✗ git não está instalado (necessário para obter o OpenUpgrade)$(C_RESET)\n"; exit 1; }
+	if [ -n "$(ENTERPRISE_FOUND)" ]; then
+		printf "$(C_YELL)! ambiente Enterprise: o OpenUpgrade NÃO migra módulos Enterprise — se a BD os usa, usa make migrate-odoo (serviço oficial)$(C_RESET)\n"
+	fi
+	PLAN="$$FROM"; c=$$F; while [ $$c -lt $$T ]; do c=$$((c+1)); PLAN="$$PLAN → $$c.0"; done
+	printf "$(C_BOLD)Migração da BD $$DBNAME: $$PLAN$(C_RESET)\n"
+	printf "$(C_DIM)  cada passo deixa um backup em $(BACKUP_ABS) (ponto de retorno) e um log em $(MIGRATIONS_DIR)$(C_RESET)\n\n"
+	mkdir -p "$(MIGRATIONS_DIR)"
+	cur=$$F
+	while [ $$cur -lt $$T ]; do
+		CV="$$cur.0"; NV="$$((cur+1)).0"
+		printf "$(C_BOLD)━━ passo $$CV → $$NV ━━$(C_RESET)\n"
+		SNAP="$${DBNAME}_antes-de-$$NV.zip"
+		$(MAKE) --no-print-directory backup _V=$$CV DB=$$DBNAME BACKUP_NAME=$$SNAP
+		OU="$(MIGRATIONS_DIR)/openupgrade-$$NV"
+		if [ ! -d "$$OU/.git" ]; then
+			printf "$(C_CYAN)→ a obter o OpenUpgrade $$NV ($(OPENUPGRADE_REPO))$(C_RESET)\n"
+			git clone --depth 1 -b "$$NV" "$(OPENUPGRADE_REPO)" "$$OU"
+		else
+			git -C "$$OU" pull --ff-only -q 2>/dev/null || true
+		fi
+		$(MAKE) --no-print-directory restore _V=$$NV FILE="$(BACKUP_ABS)/$$SNAP" DB=$$DBNAME RESTORE_START=0
+		$(MAKE) --no-print-directory _migrate-step _V=$$NV DB=$$DBNAME OU="$$OU" LOG="$(MIGRATIONS_DIR)/$${DBNAME}_$$CV-para-$$NV.log"
+		cur=$$((cur+1))
+	done
+	printf "\n$(C_GREEN)✓ BD $$DBNAME migrada para o Odoo $(TO)$(C_RESET) $(C_DIM)(ambiente odoo-$$(echo $(TO) | tr . -); a BD original na $$FROM ficou intacta)$(C_RESET)\n"
+	if [ "$(SWITCH)" = "1" ]; then
+		$(MAKE) --no-print-directory _set-env KEY=ODOO_VERSION VAL="$(TO)"
+		$(MAKE) --no-print-directory _set-env KEY=ODOO_DB VAL="$$DBNAME"
+		$(MAKE) --no-print-directory up
+	else
+		printf "$(C_DIM)  para usar: no .env põe ODOO_VERSION=$(TO) e ODOO_DB=$$DBNAME e corre make up (ou repete com SWITCH=1)$(C_RESET)\n"
+	fi
+
+# um passo de migração: corre odoo -u all com os scripts do OpenUpgrade no
+# ambiente da versão _V (a BD já foi restaurada lá pelo make migrate)
+.PHONY: _migrate-step
+_migrate-step: guard
+	@printf "$(C_CYAN)→ odoo $(ODOO_VERSION): -u all com OpenUpgrade em $(DB) (demora; log: $(LOG))$(C_RESET)\n"
+	$(COMPOSE) up -d --wait db
+	$(COMPOSE) run --rm -T --no-deps -v "$(OU)":/mnt/openupgrade:ro odoo \
+		odoo -d "$(DB)" \
+			--addons-path=/mnt/openupgrade$(ADDONS_PATH_CE) \
+			--upgrade-path=/mnt/openupgrade/openupgrade_scripts/scripts \
+			--load=base,web,openupgrade_framework \
+			-u all --stop-after-init --log-level=warn 2>&1 | tee "$(LOG)"
+	test $${PIPESTATUS[0]} -eq 0 || {
+		printf "$(C_RED)✗ a migração para $(ODOO_VERSION) falhou — vê $(LOG)$(C_RESET)\n"
+		printf "$(C_YELL)  causas habituais: módulo custom não migrado para $(ODOO_VERSION) (make migrate-module) ou módulo sem scripts no OpenUpgrade;$(C_RESET)\n"
+		printf "$(C_YELL)  corrige e repete o make migrate — o backup anterior ao passo está em $(BACKUP_ABS)$(C_RESET)\n"
+		exit 1
+	}
+	printf "$(C_GREEN)✓ passo concluído: $(DB) está agora na $(ODOO_VERSION)$(C_RESET)\n"
+
+.PHONY: migrate-module
+migrate-module: guard check-env  ## Migra o CÓDIGO de um módulo entre versões (MODULE=<m> TO=<v> [FROM=<v>]) — semi-automático
+	@test -n "$(MODULE)" && test -n "$(TO)" || { printf "$(C_RED)✗ uso: make migrate-module MODULE=<nome> TO=<versão> [FROM=<versão>]$(C_RESET)\n"; exit 1; }
+	FROM="$(if $(FROM),$(FROM),$(ODOO_VERSION))"
+	# procura o módulo em todas as pastas de addons (addons/, repos/, ADDONS_PATHS)
+	HOST=""; CONT=""
+	for m in $(ADDONS_MAP); do
+		if [ -d "$${m%%=*}/$(MODULE)" ]; then HOST="$${m%%=*}"; CONT="$${m#*=}"; break; fi
+	done
+	test -n "$$HOST" || { printf "$(C_RED)✗ módulo $(MODULE) não encontrado em nenhuma pasta de addons$(C_RESET) $(C_DIM)(make status lista-as)$(C_RESET)\n"; exit 1; }
+	$(MAKE) --no-print-directory ensure-image
+	mkdir -p "$(MIGRATIONS_DIR)"
+	LOG="$(MIGRATIONS_DIR)/$(MODULE)_$$FROM-para-$(TO).log"
+	printf "$(C_CYAN)→ odoo-module-migrator: $(MODULE) $$FROM → $(TO) (altera $$HOST/$(MODULE) no lugar; log: $$LOG)$(C_RESET)\n"
+	printf "$(C_DIM)  faz commit/backup do módulo antes — a ferramenta trata da parte mecânica, o resto é manual$(C_RESET)\n"
+	$(COMPOSE) run --rm -T --no-deps --user root odoo bash -c '\
+		pip3 install -q odoo-module-migrator \
+		&& odoo-module-migrate --directory '"$$CONT"' --modules $(MODULE) \
+			--init-version-name '"$$FROM"' --target-version-name $(TO) --no-commit; \
+		rc=$$?; chown -R $$(id -u):$$(id -g) '"$$CONT"'/$(MODULE); exit $$rc' 2>&1 | tee "$$LOG"
+	test $${PIPESTATUS[0]} -eq 0 || { printf "$(C_RED)✗ o migrador falhou — vê $$LOG$(C_RESET)\n"; exit 1; }
+	N=$$(grep -ciE 'warning|todo|manual' "$$LOG" 2>/dev/null || true)
+	printf "$(C_GREEN)✓ parte mecânica feita em $$HOST/$(MODULE)$(C_RESET) $(C_DIM)($$N aviso(s) no log a rever à mão)$(C_RESET)\n"
+	printf "$(C_YELL)  revê o diff e o log; testa com: ODOO_VERSION=$(TO) no .env → make up → make install MODULE=$(MODULE)$(C_RESET)\n"
+
+.PHONY: migrate-odoo
+migrate-odoo: guard check-env  ## Upgrade da BD pelo serviço oficial upgrade.odoo.com (Enterprise; DB=<bd> TO=<v> MODE=test|production)
+	@test -n "$(TO)" || { printf "$(C_RED)✗ uso: make migrate-odoo DB=<bd> TO=<versão> [MODE=test|production]$(C_RESET)\n"; exit 1; }
+	$(MAKE) --no-print-directory ensure-image
+	printf "$(C_CYAN)→ serviço oficial de upgrade (upgrade.odoo.com), modo $(MODE): $(DB) → $(TO)$(C_RESET)\n"
+	printf "$(C_DIM)  requer subscrição Enterprise válida; a BD é enviada para a Odoo — segue as mensagens do script$(C_RESET)\n"
+	$(COMPOSE) up -d --wait db
+	$(COMPOSE) run --rm --no-deps \
+		-e PGHOST=db -e PGUSER=$(PGUSER) -e PGPASSWORD="$(call env,POSTGRES_PASSWORD)" \
+		odoo bash -c 'python3 <(curl -sS https://upgrade.odoo.com/upgrade) $(MODE) -d "$(DB)" -t $(TO)'
+	printf "$(C_DIM)  a BD actualizada fica neste Postgres (ambiente $(ODOO_VERSION)); para a usar na $(TO): make backup DB=<nome-devolvido>, depois no .env ODOO_VERSION=$(TO) → make restore FILE=…$(C_RESET)\n"
