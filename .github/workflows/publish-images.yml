@@ -1,0 +1,116 @@
+# Publica no GitHub Container Registry a imagem BASE do ambiente (fase "base"
+# do Dockerfile: odoo oficial + toolchain + requirements.txt + ajustes por
+# versão), uma por versão do Odoo suportada:
+#
+#   ghcr.io/<dono>/<repo>:<odoo>-v<setup>   ex.: ghcr.io/danieluac/odoo-dev-env:18.0-v1.0.0
+#   ghcr.io/<dono>/<repo>:<odoo>            tag móvel = última release
+#
+# Dispara:
+#   - automaticamente ao publicar uma release (push da tag v<setup>, ex.:
+#     v1.0.0): constrói TODAS as versões suportadas a partir dessa tag;
+#   - manualmente (Actions → "Publicar imagens base" → Run workflow), para
+#     as versões indicadas, a partir da branch escolhida.
+#
+# A lista de versões suportadas vem do Makefile (SUPPORTED_VERSIONS) — há um
+# único sítio onde se acrescenta uma versão.
+#
+# Requisitos (uma vez): Settings → Actions → General → Workflow permissions
+# = "Read and write permissions". Depois da 1ª publicação, confirma em
+# Packages que o pacote é público (senão o make up cai no build local).
+name: Publicar imagens base
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      setup_version:
+        description: "Versão do setup (ex.: 1.0.0) — fica na tag <odoo>-v<setup>"
+        required: true
+        type: string
+      odoo_versions:
+        description: "Versões do Odoo a publicar, separadas por espaço (vazio = todas as suportadas)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  preparar:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: m
+        shell: bash
+        run: |
+          set -euo pipefail
+          supported="$(sed -nE 's/^SUPPORTED_VERSIONS[[:space:]]*:?=[[:space:]]*//p' Makefile)"
+          [ -n "$supported" ] || { echo "SUPPORTED_VERSIONS não encontrado no Makefile"; exit 1; }
+          if [ "${{ github.event_name }}" = "push" ]; then
+            tag="${GITHUB_REF#refs/tags/}"          # ex.: v1.0.0
+            echo "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || { echo "tag '$tag' não segue v<major>.<minor>.<patch>"; exit 1; }
+            setup="${tag#v}"
+            versions="$supported"
+          else
+            setup="${{ inputs.setup_version }}"
+            versions="${{ inputs.odoo_versions }}"
+            [ -n "$versions" ] || versions="$supported"
+          fi
+          items=""
+          for odoo in $versions; do
+            echo " $supported " | grep -q " $odoo " || { echo "versão não suportada: $odoo (suportadas: $supported)"; exit 1; }
+            items="${items:+$items,}{\"odoo\":\"$odoo\",\"setup\":\"$setup\"}"
+          done
+          echo "matrix={\"include\":[$items]}" >> "$GITHUB_OUTPUT"
+          echo "matriz: {\"include\":[$items]}"
+
+  publicar:
+    needs: preparar
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.preparar.outputs.matrix) }}
+    name: "Odoo ${{ matrix.odoo }} — setup ${{ matrix.setup }}"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Nome da imagem (minúsculas, como o GHCR exige)
+        id: img
+        shell: bash
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Construir e publicar a fase base
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: base
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            ODOO_VERSION=${{ matrix.odoo }}
+          tags: |
+            ${{ steps.img.outputs.name }}:${{ matrix.odoo }}-v${{ matrix.setup }}
+            ${{ steps.img.outputs.name }}:${{ matrix.odoo }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ matrix.odoo }}-v${{ matrix.setup }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=MIT
+          cache-from: type=gha,scope=${{ matrix.odoo }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.odoo }}
