@@ -7,6 +7,9 @@ suportadas. Ver a secção "Releases" do `CONTRIBUTING.md`.
 
 ## Não lançado
 
+- O `make up` mostra o progresso da descarga da imagem base (antes
+  descarregava em silêncio e parecia parado durante minutos) e só a
+  descarrega quando a publicada é diferente da que já existe localmente.
 - Build sem avisos: o `Dockerfile` declara que o aviso
   `InvalidDefaultArgInFrom` é esperado (a versão vem sempre do build arg) e
   deixa de mostrar o aviso do `pip` a correr como root; o workflow passa a

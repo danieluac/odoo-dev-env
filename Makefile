@@ -469,15 +469,25 @@ conf: init
 
 # decide a imagem de partida do build e imprime-a (stdout): a publicada no
 # GHCR, se acessível (actualizada com docker pull), senão "base" (build local).
-# Mensagens vão para stderr para não contaminarem o valor.
+# Mensagens e o progresso do pull vão para stderr para não contaminarem o valor.
 .PHONY: _base-image
 _base-image:
 	@if [ "$(BASE_IMAGE)" = "local" ]; then echo base; exit 0; fi
 	# consulta rápida ao registo (só metadados, com limite de tempo) antes do pull
-	reach() { if command -v timeout >/dev/null 2>&1; then timeout 20 docker buildx imagetools inspect "$(BASE_IMAGE)"; else docker buildx imagetools inspect "$(BASE_IMAGE)"; fi; }
-	if reach >/dev/null 2>&1 && docker pull -q "$(BASE_IMAGE)" >/dev/null 2>&1; then
-		echo "$(BASE_IMAGE)"
-	elif docker image inspect "$(BASE_IMAGE)" >/dev/null 2>&1; then
+	reach() { if command -v timeout >/dev/null 2>&1; then timeout 20 docker buildx imagetools inspect "$$@" "$(BASE_IMAGE)"; else docker buildx imagetools inspect "$$@" "$(BASE_IMAGE)"; fi; }
+	remote="$$(reach --format '{{.Manifest.Digest}}' 2>/dev/null || true)"
+	if [ -n "$$remote" ]; then
+		# já temos esta exacta imagem? (o digest do índice fica em RepoDigests) → nada a descarregar
+		have="$$(docker image inspect --format '{{join .RepoDigests ","}}' "$(BASE_IMAGE)" 2>/dev/null || true)"
+		case "$$have" in *"$$remote"*) echo "$(BASE_IMAGE)"; exit 0;; esac
+		printf "$(C_CYAN)→ a descarregar a imagem base $(BASE_IMAGE)$(C_RESET) $(C_DIM)(só na 1ª vez e quando há release nova; pode demorar alguns minutos)$(C_RESET)\n" >&2
+		if docker pull "$(BASE_IMAGE)" >&2; then
+			echo "$(BASE_IMAGE)"; exit 0
+		fi
+		printf "$(C_YELL)! a descarga de $(BASE_IMAGE) falhou$(C_RESET)\n" >&2
+	fi
+	# sem acesso ao registo (ou pull falhado): cópia local se existir, senão build local
+	if docker image inspect "$(BASE_IMAGE)" >/dev/null 2>&1; then
 		printf "$(C_YELL)! não foi possível actualizar $(BASE_IMAGE) (sem rede?) — a usar a cópia local$(C_RESET)\n" >&2
 		echo "$(BASE_IMAGE)"
 	else
