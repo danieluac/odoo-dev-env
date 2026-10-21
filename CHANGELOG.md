@@ -5,8 +5,16 @@ versão é o do **setup** (não o do Odoo). Cada release tem a tag `v<versão>`
 (ex.: `v1.0.0`) e publica as imagens base de todas as versões do Odoo
 suportadas. Ver a secção "Releases" do `CONTRIBUTING.md`.
 
-## Não lançado
+## 1.0.1 — 2026-10-21
 
+- Correcção: no Odoo 18, 19 e 20 o servidor não arrancava
+  (`FileNotFoundError: …/pytz/zoneinfo/Canada/Saskatchewan`). O pacote PyPI
+  `tzdata`, arrastado pelo pandas, acrescentava ao Python nomes legados de
+  fusos horários que o `tzdata` do Ubuntu 24.04 só tem no pacote
+  `tzdata-legacy`, e o Odoo tenta abrir todos ao carregar o módulo `base`.
+  A imagem passa a ter o `tzdata` do sistema actualizado e o `tzdata-legacy`,
+  e deixa de incluir o pacote PyPI; a verificação no fim do build
+  (`scripts/check_image.py`) confirma que todos os fusos horários abrem.
 - O `make up` mostra o progresso da descarga da imagem base (antes
   descarregava em silêncio e parecia parado durante minutos) e só a
   descarrega quando a publicada é diferente da que já existe localmente.

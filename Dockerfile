@@ -59,7 +59,11 @@ RUN set -eux; \
             > /etc/apt/apt.conf.d/99-bullseye-snapshot; \
     fi; \
     apt-get update; \
-    apt-get install -y --no-install-recommends build-essential python3-dev unixodbc-dev git; \
+    # tzdata actualizado e, onde existe (Ubuntu 24.04+), tzdata-legacy: os
+    # nomes legados de fusos horários (Canada/*, US/*, …) saíram do tzdata
+    # base e o Odoo 18+ precisa de os conseguir abrir (ver scripts/check_image.py)
+    apt-get install -y --no-install-recommends build-essential python3-dev unixodbc-dev git tzdata \
+        $(apt-cache show tzdata-legacy >/dev/null 2>&1 && echo tzdata-legacy); \
     rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /tmp/requirements.txt
@@ -81,7 +85,11 @@ ENV PIP_BREAK_SYSTEM_PACKAGES=1 PIP_ROOT_USER_ACTION=ignore
 RUN pip3 install --no-cache-dir uv \
     && uv pip install --system --break-system-packages --no-cache \
         -r /tmp/requirements.txt watchdog lxml-html-clean \
-        "openupgradelib @ git+https://github.com/OCA/openupgradelib.git@master"
+        "openupgradelib @ git+https://github.com/OCA/openupgradelib.git@master" \
+    # o pacote PyPI "tzdata" (dependência declarada do pandas, dispensável em
+    # Linux) acrescenta ao zoneinfo do Python nomes que o pytz do sistema pode
+    # não conseguir abrir → o Odoo 18+ não arranca. Fica só o tzdata do sistema.
+    && (uv pip uninstall --system --break-system-packages tzdata || true)
 
 # Todas as versões: o requirements arrasta um cryptography recente, com o
 # qual o pyOpenSSL que a imagem oficial traz via apt (20.0 em bullseye, 21.0
@@ -97,11 +105,10 @@ RUN uv pip install --system --break-system-packages --no-cache "pyOpenSSL>=24.2"
             "urllib3>=1.26.16,<2" "lxml>=5.2,<6"; \
     fi
 
-# Verificação da base: importa o Odoo e as bibliotecas sensíveis a versões.
+# Verificação da base (imports + fusos horários — ver scripts/check_image.py).
 # Garante que a imagem publicada arranca antes de ir para o registo.
-RUN python3 -c "import importlib, sys; \
-    [importlib.import_module(m) for m in 'OpenSSL cryptography urllib3 requests psycopg2 lxml lxml.html.clean pandas pyodbc debugpy watchdog odoo odoo.tools.mail odoo.release'.split()]; \
-    import odoo.release as r; print('OK (base): Odoo', r.version, '| Python', sys.version.split()[0])"
+COPY scripts/check_image.py /usr/local/lib/odoo-dev-env/check_image.py
+RUN python3 /usr/local/lib/odoo-dev-env/check_image.py base
 
 USER odoo
 
@@ -144,13 +151,17 @@ RUN uv pip install --system --break-system-packages --no-cache "pyOpenSSL>=24.2"
     && if [ "${ODOO_VERSION%%.*}" = "16" ]; then \
         uv pip install --system --break-system-packages --no-cache \
             "urllib3>=1.26.16,<2" "lxml>=5.2,<6"; \
-    fi
+    fi \
+    # idem fase base: uma dependência dos repos pode ter voltado a trazer o
+    # pacote PyPI tzdata (ver scripts/check_image.py)
+    && (uv pip uninstall --system --break-system-packages tzdata || true)
 
-# Verificação no fim do build: se alguma combinação tiver ficado
-# inconsistente, o build falha AQUI com o erro de import, em vez de o
-# servidor falhar a arrancar mais tarde.
-RUN python3 -c "import importlib, sys; \
-    [importlib.import_module(m) for m in 'OpenSSL cryptography urllib3 requests psycopg2 lxml lxml.html.clean pandas pyodbc debugpy watchdog odoo odoo.tools.mail odoo.release'.split()]; \
-    import odoo.release as r; print('OK: Odoo', r.version, '| Python', sys.version.split()[0])"
+# Verificação no fim do build (imports + fusos horários): se alguma
+# combinação tiver ficado inconsistente, o build falha AQUI com uma mensagem
+# legível, em vez de o servidor falhar a arrancar mais tarde. O script é
+# copiado do contexto para funcionar também sobre bases publicadas antes
+# de ele existir.
+COPY scripts/check_image.py /tmp/check_image.py
+RUN python3 /tmp/check_image.py final && rm -f /tmp/check_image.py
 
 USER odoo
