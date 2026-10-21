@@ -5,6 +5,13 @@ versão é o do **setup** (não o do Odoo). Cada release tem a tag `v<versão>`
 (ex.: `v1.0.0`) e publica as imagens base de todas as versões do Odoo
 suportadas. Ver a secção "Releases" do `CONTRIBUTING.md`.
 
+## Não lançado
+
+- Build sem avisos: o `Dockerfile` declara que o aviso
+  `InvalidDefaultArgInFrom` é esperado (a versão vem sempre do build arg) e
+  deixa de mostrar o aviso do `pip` a correr como root; o workflow passa a
+  usar as versões das actions que correm em Node.js 24.
+
 ## 1.0.0 — 2026-10-21
 
 Primeira release.

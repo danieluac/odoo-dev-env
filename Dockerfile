@@ -1,4 +1,8 @@
 # syntax=docker/dockerfile:1
+# check=skip=InvalidDefaultArgInFrom
+# (o aviso acima é esperado: ODOO_VERSION não tem valor por omissão de
+#  propósito — ver abaixo — e por isso os FROM só ficam válidos com o build arg)
+#
 # Imagem Odoo do ambiente, em duas fases:
 #
 #   base  — imagem oficial odoo:<versão> + toolchain + dependências do
@@ -62,7 +66,7 @@ COPY requirements.txt /tmp/requirements.txt
 
 # PIP_BREAK_SYSTEM_PACKAGES: necessário nas imagens Ubuntu 24.04 (Odoo 18+),
 # cujo pip aplica a PEP 668; ignorado pelo pip mais antigo das outras imagens.
-ENV PIP_BREAK_SYSTEM_PACKAGES=1
+ENV PIP_BREAK_SYSTEM_PACKAGES=1 PIP_ROOT_USER_ACTION=ignore
 
 # deps instaladas com uv (rápido e resolução previsível);
 # watchdog: necessário para o auto-reload (--dev=reload);
@@ -107,7 +111,7 @@ USER odoo
 FROM ${BASE_IMAGE} AS final
 
 USER root
-ENV PIP_BREAK_SYSTEM_PACKAGES=1
+ENV PIP_BREAK_SYSTEM_PACKAGES=1 PIP_ROOT_USER_ACTION=ignore
 
 # Dependências python dos repos de módulos: o make junta os requirements.txt
 # que encontra em addons/, repos/ e ADDONS_PATHS em config/requirements.addons.txt
