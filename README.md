@@ -259,6 +259,38 @@ Com `ODOO_DEV=reload,qweb,xml` (o default do `.env`), o servidor reinicia
 sozinho quando um `.py` muda — na maioria dos casos nem precisas do
 `make restart`.
 
+### Actualização automática de módulos
+
+O auto-reload só recarrega código Python. Vistas, dados XML/CSV, traduções,
+campos novos ou alterações ao manifesto só entram na base de dados com um
+`make update`. Para não teres de o correr a cada gravação, indica no `.env`
+os módulos em que estás a trabalhar:
+
+```ini
+AUTO_UPDATE=minha_app,outra_app
+```
+
+A partir do `make up` (ou `make restart`) seguinte, um observador dentro do
+container vigia as pastas desses módulos, onde quer que estejam
+(`addons/`, `repos/` ou `ADDONS_PATHS`), e a cada alteração corre
+`odoo -u <módulos>` sobre a base de dados activa, num processo à parte. O
+servidor apanha a alteração no pedido seguinte; basta actualizar a página.
+Várias gravações seguidas dão origem a uma única actualização, e o resultado
+(tempo, ou o erro, se a actualização falhar) aparece em `make logs` com o
+prefixo `[auto-update]`. O `make status` mostra se está a correr.
+
+Para um módulo pontual, sem mexer no `.env`:
+
+```bash
+make watch MODULE=minha_app      # em primeiro plano; Ctrl-C para parar
+make watch-stop                  # pára o observador em segundo plano
+```
+
+Ficheiros temporários de editores, `__pycache__`, `.git` e `node_modules`
+são ignorados. Uma actualização demora o mesmo que um `make update` (alguns
+segundos num módulo pequeno), por isso lista só os módulos em que estás
+mesmo a mexer.
+
 ### Módulos de outros repositórios
 
 Os teus módulos vivem normalmente nos seus próprios repositórios git, com a
@@ -487,6 +519,7 @@ devolvido>` e depois, no ambiente da versão nova, `make restore FILE=…`.
 | `ODOO_LOG` | `info` | Nível de log (`debug`, `info`, `warn`, `error`) |
 | `ODOO_DEV` | `reload,qweb,xml` | Modos dev do Odoo (`none` desactiva) |
 | `ODOO_DEMO` | `0` | `1` = BDs novas e `make install` com dados de demonstração (§7) |
+| `AUTO_UPDATE` | vazio | Módulos (separados por vírgula) actualizados automaticamente a cada alteração nos seus ficheiros (§7) |
 | `ODOO_DEBUG` / `ODOO_WAIT` | — | Debug permanente / esperar pelo VS Code antes de arrancar |
 | `ENTERPRISE_DIR` | vazio | Caminho dos addons Enterprise fora do setup (em `repos/` são detectados sozinhos); com Enterprise presente as BDs novas nascem em modo Enterprise (§7) |
 | `ADDONS_PATHS` | vazio | Pastas de addons fora do setup, separadas por vírgula (§7); alternativa sem configuração: pasta `repos/` |
