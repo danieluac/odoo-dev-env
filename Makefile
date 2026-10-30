@@ -66,6 +66,12 @@ BASE_IMAGE      = $(if $(BASE_IMAGE_CFG),$(BASE_IMAGE_CFG),$(IMAGE_REPO):$(ODOO_
 # Até à 18 o Odoo carrega demo por omissão (--without-demo=all desliga);
 # a partir da 19 não carrega (--with-demo liga). A flag certa para a versão:
 ODOO_DEMO   = $(call env,ODOO_DEMO)
+
+# ── Actualização automática de módulos (AUTO_UPDATE no .env) ─────────
+# Lista de módulos (a,b,c) cujas pastas são observadas dentro do container;
+# a cada alteração corre `odoo -u` sobre a BD activa (scripts/watch_update.py).
+AUTO_UPDATE = $(call env,AUTO_UPDATE)
+WATCH_PID   = /var/lib/odoo/.watch_update.pid
 _DEMO_NEWCLI = $(filter 19 2% 3%,$(ODOO_MAJOR))
 DEMO_FLAG   = $(if $(filter 1,$(ODOO_DEMO)),$(if $(_DEMO_NEWCLI),--with-demo,),$(if $(_DEMO_NEWCLI),,--without-demo=all))
 DEMO_LABEL  = $(if $(filter 1,$(ODOO_DEMO)),com dados de demonstração,sem dados de demonstração)
@@ -215,6 +221,7 @@ help:  ## Mostra esta ajuda
 	@printf "  make migrate DB=prod TO=17.0           # migra a BD 'prod' da versão actual para a 17.0 (OpenUpgrade)\n"
 	@printf "  make migrate-module MODULE=x TO=18.0   # migra o código do módulo x para a 18.0 (semi-automático)\n"
 	@printf "  make debug                             # sobe com debugpy em :5678 (attach do VS Code)\n"
+	@printf "  make watch MODULE=minha_app            # actualiza o módulo a cada alteração (permanente: AUTO_UPDATE no .env)\n"
 	@printf "\n$(C_DIM)Configuração (versão do Odoo, porta, credenciais, pastas de addons…): edita o .env e corre make up$(C_RESET)\n"
 
 # ═════════════════════════════════════════════════════════════════════
@@ -315,6 +322,7 @@ check-env: init
 	inst="$(call env,INSTANCE)"
 	echo "$$inst" | grep -qE '^[a-z0-9_-]*$$' || { printf "$(C_RED)✗ INSTANCE inválido no .env ('$$inst'): usa só minúsculas, dígitos, - e _$(C_RESET)\n"; exit 1; }
 	echo "$(ODOO_DEMO)" | grep -qE '^[01]?$$' || { printf "$(C_RED)✗ ODOO_DEMO inválido no .env ('$(ODOO_DEMO)'): usa 0 ou 1$(C_RESET)\n"; exit 1; }
+	echo "$(AUTO_UPDATE)" | grep -qE '^([a-z0-9_]+(,[a-z0-9_]+)*)?$$' || { printf "$(C_RED)✗ AUTO_UPDATE inválido no .env ('$(AUTO_UPDATE)'): nomes de módulos separados por vírgula, sem espaços$(C_RESET)\n"; exit 1; }
 	if [ -n "$(ENTERPRISE_DIR)" ] && [ ! -f "$(ENTERPRISE_ABS)/web_enterprise/__manifest__.py" ]; then
 		printf "$(C_YELL)! ENTERPRISE_DIR=$(ENTERPRISE_DIR) não contém o módulo web_enterprise — confirma o caminho (e a versão) dos addons Enterprise$(C_RESET)\n"
 	fi
@@ -524,6 +532,7 @@ up: guard check-env conf _check-project  ## Sobe o ambiente completo (Odoo + Pos
 	fi
 	printf "$(C_CYAN)→ a subir o Odoo$(C_RESET)\n"
 	$(COMPOSE) up -d odoo
+	$(MAKE) --no-print-directory _watch-start
 	printf "\n$(C_GREEN)✓ ambiente pronto$(C_RESET) → $(C_BOLD)http://localhost:$(ODOO_PORT)$(C_RESET)  (Odoo $(ODOO_VERSION) $(EDITION) · BD: $(DB) · login: admin / admin)\n"
 
 .PHONY: debug
@@ -531,6 +540,7 @@ debug: guard check-env conf ensure-image _check-project  ## Sobe com debugpy à 
 	@printf "$(C_CYAN)→ a subir em modo debug (debugpy em :$(call env,ODOO_DEBUG_PORT), sem auto-reload)$(C_RESET)\n"
 	$(COMPOSE) up -d --wait db
 	ODOO_DEBUG=1 ODOO_DEV=qweb,xml $(COMPOSE) -f $(ROOT_DIR)/docker-compose.debug.yml up -d odoo
+	$(MAKE) --no-print-directory _watch-start
 	printf "$(C_GREEN)✓ debugpy à escuta em :$(call env,ODOO_DEBUG_PORT)$(C_RESET) — attach pelo VS Code (F5, config \"Odoo\")\n"
 	printf "$(C_DIM)  nota: o auto-reload fica desligado em debug; make up volta ao modo normal$(C_RESET)\n"
 
@@ -542,7 +552,32 @@ down: guard init  ## Pára o ambiente (os dados persistem nos volumes)
 .PHONY: restart
 restart: guard check-env conf  ## Reinicia o servidor Odoo (aplica mudanças do .env)
 	@$(COMPOSE) up -d --force-recreate odoo
+	$(MAKE) --no-print-directory _watch-start
 	printf "$(C_GREEN)✓ odoo reiniciado$(C_RESET)\n"
+
+# arranca (ou reinicia) o observador de módulos dentro do container odoo,
+# em segundo plano, quando AUTO_UPDATE está definido no .env. Corre no mesmo
+# container para ver exactamente as mesmas pastas de addons que o servidor.
+.PHONY: _watch-start
+_watch-start:
+	@if [ -n "$(AUTO_UPDATE)" ]; then
+		$(COMPOSE) exec -T odoo sh -c 'p=$$(cat $(WATCH_PID) 2>/dev/null); [ -n "$$p" ] && kill "$$p" 2>/dev/null; exit 0'
+		$(COMPOSE) exec -d odoo python3 /mnt/scripts/watch_update.py --db "$(DB)" $(AUTO_UPDATE)
+		printf "$(C_CYAN)→ actualização automática activa para: $(C_BOLD)$(AUTO_UPDATE)$(C_RESET) $(C_DIM)(AUTO_UPDATE no .env; registo em make logs)$(C_RESET)\n"
+	fi
+
+.PHONY: watch
+watch: guard check-env  ## Observa módulos e actualiza-os a cada alteração, em primeiro plano (MODULE=a,b; sem MODULE usa AUTO_UPDATE)
+	@MODS="$(if $(MODULE),$(MODULE),$(AUTO_UPDATE))"
+	test -n "$$MODS" || { printf "$(C_RED)✗ uso: make watch MODULE=<nome[,nome…]>$(C_RESET) $(C_DIM)(ou define AUTO_UPDATE no .env)$(C_RESET)\n"; exit 1; }
+	$(COMPOSE) ps --status running odoo 2>/dev/null | grep -q odoo || { printf "$(C_RED)✗ o ambiente não está a correr$(C_RESET) — make up primeiro\n"; exit 1; }
+	printf "$(C_CYAN)→ a observar $$MODS na BD $(DB) (Ctrl-C para parar)$(C_RESET)\n"
+	$(COMPOSE) exec odoo python3 /mnt/scripts/watch_update.py --db "$(DB)" --foreground $$MODS || true
+	[ -z "$(AUTO_UPDATE)" ] || printf "$(C_DIM)  para voltar a ter a actualização automática em segundo plano: make restart$(C_RESET)\n"
+
+.PHONY: watch-stop
+watch-stop: guard init  ## Pára a actualização automática em segundo plano (até ao próximo make up/restart)
+	@$(COMPOSE) exec -T odoo sh -c 'p=$$(cat $(WATCH_PID) 2>/dev/null); if [ -n "$$p" ] && kill "$$p" 2>/dev/null; then echo parada; else echo "não estava a correr"; fi' 2>/dev/null || echo "o ambiente não está a correr"
 
 .PHONY: logs
 logs: guard init  ## Segue os logs do Odoo (Ctrl-C para sair)
@@ -557,6 +592,12 @@ status: guard init  ## Estado do ambiente (versão, BD activa, containers)
 	@printf "$(C_BOLD)Ambiente$(C_RESET)\n"
 	printf "  $(C_DIM)Odoo:$(C_RESET)      $(ODOO_VERSION) $(EDITION)$(if $(ENTERPRISE_FOUND), $(C_DIM)(web_enterprise em $(patsubst %/web_enterprise/__manifest__.py,%,$(ENTERPRISE_FOUND)))$(C_RESET),)\n"
 	printf "  $(C_DIM)Demo:$(C_RESET)      $(if $(filter 1,$(ODOO_DEMO)),sim,não) $(C_DIM)(ODOO_DEMO — só BDs novas e make install)$(C_RESET)\n"
+	if [ -n "$(AUTO_UPDATE)" ]; then
+		if $(COMPOSE) exec -T odoo sh -c 'p=$$(cat $(WATCH_PID) 2>/dev/null); [ -n "$$p" ] && [ -d /proc/$$p ]' >/dev/null 2>&1; then w="a correr"; else w="parada — make restart"; fi
+		printf "  $(C_DIM)Auto-update:$(C_RESET) $(AUTO_UPDATE) $(C_DIM)($$w; AUTO_UPDATE no .env)$(C_RESET)\n"
+	else
+		printf "  $(C_DIM)Auto-update:$(C_RESET) desligada $(C_DIM)(AUTO_UPDATE=a,b no .env para actualizar módulos a cada alteração)$(C_RESET)\n"
+	fi
 	printf "  $(C_DIM)Imagem:$(C_RESET)    odoo-custom:$(ODOO_VERSION) $(C_DIM)(base: $(if $(filter local,$(BASE_IMAGE)),build local a partir da imagem oficial,$(BASE_IMAGE)$(comma) com fallback para build local))$(C_RESET)\n"
 	printf "  $(C_DIM)Projecto:$(C_RESET)  $(PROJECT) $(C_DIM)(pasta: $(ROOT_DIR))$(C_RESET)\n"
 	printf "  $(C_DIM)BD activa:$(C_RESET) $(call env,ODOO_DB)\n"

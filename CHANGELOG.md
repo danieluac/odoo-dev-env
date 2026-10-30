@@ -5,6 +5,15 @@ versão é o do **setup** (não o do Odoo). Cada release tem a tag `v<versão>`
 (ex.: `v1.0.0`) e publica as imagens base de todas as versões do Odoo
 suportadas. Ver a secção "Releases" do `CONTRIBUTING.md`.
 
+## Não lançado
+
+- Actualização automática de módulos: `AUTO_UPDATE=a,b` no `.env` faz o
+  ambiente observar as pastas desses módulos e correr `odoo -u` sobre a BD
+  activa a cada alteração (vistas, dados, traduções, campos novos), sem
+  reiniciar o servidor; `make watch MODULE=x` faz o mesmo em primeiro plano
+  para um módulo pontual, `make watch-stop` pára. Estado em `make status`,
+  registo em `make logs`.
+
 ## 1.0.1 — 2026-10-21
 
 - Correcção: no Odoo 18, 19 e 20 o servidor não arrancava
