@@ -7,6 +7,16 @@ suportadas. Ver a secção "Releases" do `CONTRIBUTING.md`.
 
 ## Não lançado
 
+- Gestor de bibliotecas Python dos módulos: `make pip-add PKG=… MODULE=…`
+  escreve o pacote no `requirements.txt` do módulo (criado se faltar) e
+  instala-o já no ambiente; `make pip-remove` retira e desinstala (só se
+  mais nenhum `requirements.txt` o pedir e não fizer parte da imagem base);
+  `make pip-list` mostra os ficheiros e o que está instalado. `IN=<pasta>`
+  gere o `requirements.txt` de uma pasta em vez do de um módulo. Os
+  `requirements.txt` dentro dos módulos das pastas de `ADDONS_PATHS` passam
+  também a ser descobertos.
+- `make install` e `make update` voltam a arrancar a actualização automática
+  depois de reiniciarem o servidor.
 - Actualização automática de módulos: `AUTO_UPDATE=a,b` no `.env` faz o
   ambiente observar as pastas desses módulos e correr `odoo -u` sobre a BD
   activa a cada alteração (vistas, dados, traduções, campos novos), sem
