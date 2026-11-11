@@ -7,6 +7,11 @@ suportadas. Ver a secção "Releases" do `CONTRIBUTING.md`.
 
 ## Não lançado
 
+- PyCharm: `make pycharm` mostra o passo a passo e os valores (endereço e
+  mapeamentos de pastas deste ambiente) para a configuração "Attach to DAP"
+  do PyCharm 2026.1+, que se liga ao `debugpy` do `make debug`; mensagens e
+  documentação de depuração passam a cobrir os dois editores; `.idea/`
+  ignorada pelo git.
 - Actualização automática de módulos: `AUTO_UPDATE=a,b` no `.env` faz o
   ambiente observar as pastas desses módulos e correr `odoo -u` sobre a BD
   activa a cada alteração (vistas, dados, traduções, campos novos), sem

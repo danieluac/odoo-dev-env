@@ -311,7 +311,7 @@ repos/
 
 O `make up` (ou `make restart`) descobre automaticamente todas as pastas que
 contêm módulos (pastas com `__manifest__.py` lá dentro) e põe-nas no
-`addons_path`. Abre o setup como raiz do editor: o VS Code detecta cada
+`addons_path`. Abre o setup como raiz do editor: o VS Code (e o PyCharm) detecta cada
 repositório dentro de `repos/` e mostra-os todos no painel *Source Control*
 (configuração incluída em `.vscode/settings.json`).
 
@@ -354,18 +354,43 @@ que não resolver e lista no fim o que ficou de fora. A verificação de
 importação no fim do build continua a garantir que o Odoo arranca. Ainda
 assim, o ideal é cada repo listar só as dependências reais dos módulos.
 
-### Depuração (VS Code)
+### Depuração (VS Code e PyCharm)
 
 ```bash
 make debug      # sobe o Odoo sob debugpy, à escuta em ODOO_DEBUG_PORT (5678)
 ```
 
-Depois, no VS Code: `F5` com a configuração **"Odoo"**. O ficheiro
+O servidor fica à espera que um editor se ligue pelo protocolo do
+`debugpy` (Debug Adapter Protocol). Em modo debug o auto-reload fica
+desligado; `make up` volta ao modo normal. Para depurar o próprio arranque
+do servidor, activa `ODOO_WAIT=1` no `.env`.
+
+**VS Code**: `F5` com a configuração **"Odoo"**. O ficheiro
 `.vscode/launch.json` é gerado pelo `make up`/`make conf` com um
 mapeamento por pasta de addons (`addons/`, `repos/` e `ADDONS_PATHS`), por
-isso os breakpoints funcionam em todos os módulos. Em modo debug o
-auto-reload fica desligado; `make up` volta ao modo normal. Para depurar o
-próprio arranque do servidor, activa `ODOO_WAIT=1` no `.env`.
+isso os breakpoints funcionam em todos os módulos.
+
+**PyCharm** (2026.1 ou mais recente): usa a configuração de execução
+**"Attach to DAP"**, que liga o PyCharm a um `debugpy` já a correr, como o
+do `make debug`. Os valores a preencher dependem das tuas pastas de addons,
+por isso o `make` mostra-os:
+
+```bash
+make pycharm
+```
+
+Imprime o passo a passo: *Run → Edit Configurations → + → Attach to DAP*,
+*Remote address* `localhost:5678`, e a lista de *Path Mappings* (pasta local
+→ pasta no container), uma por pasta de addons. Depois é *Debug* com a
+configuração "Odoo". Se marcares *Store as project file*, fica guardada em
+`.idea/runConfigurations` (pasta ignorada pelo git) e não precisas de a
+repetir. O PyCharm detecta sozinho os repositórios clonados em `repos/`
+(*Settings → Version Control → Directory Mappings*).
+
+Em versões do PyCharm anteriores à 2026.1 não há forma de ligar ao
+`debugpy`: o ambiente serve na mesma para editar, instalar e actualizar
+módulos, ver logs e usar a actualização automática, mas a depuração passo a
+passo só está disponível no VS Code.
 
 ### Odoo Enterprise (opcional)
 
@@ -520,7 +545,7 @@ devolvido>` e depois, no ambiente da versão nova, `make restore FILE=…`.
 | `ODOO_DEV` | `reload,qweb,xml` | Modos dev do Odoo (`none` desactiva) |
 | `ODOO_DEMO` | `0` | `1` = BDs novas e `make install` com dados de demonstração (§7) |
 | `AUTO_UPDATE` | vazio | Módulos (separados por vírgula) actualizados automaticamente a cada alteração nos seus ficheiros (§7) |
-| `ODOO_DEBUG` / `ODOO_WAIT` | — | Debug permanente / esperar pelo VS Code antes de arrancar |
+| `ODOO_DEBUG` / `ODOO_WAIT` | — | Debug permanente / esperar que o editor (VS Code ou PyCharm) se ligue antes de arrancar |
 | `ENTERPRISE_DIR` | vazio | Caminho dos addons Enterprise fora do setup (em `repos/` são detectados sozinhos); com Enterprise presente as BDs novas nascem em modo Enterprise (§7) |
 | `ADDONS_PATHS` | vazio | Pastas de addons fora do setup, separadas por vírgula (§7); alternativa sem configuração: pasta `repos/` |
 | `ADDONS_REQUIREMENTS_IGNORE` | vazio | Pacotes a não instalar dos `requirements.txt` dos repos de módulos (§7) |

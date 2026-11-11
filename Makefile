@@ -220,7 +220,8 @@ help:  ## Mostra esta ajuda
 	@printf "  make scaffold MODULE=minha_app         # cria a estrutura de um módulo novo em addons/ (IN=<pasta> noutra)\n"
 	@printf "  make migrate DB=prod TO=17.0           # migra a BD 'prod' da versão actual para a 17.0 (OpenUpgrade)\n"
 	@printf "  make migrate-module MODULE=x TO=18.0   # migra o código do módulo x para a 18.0 (semi-automático)\n"
-	@printf "  make debug                             # sobe com debugpy em :5678 (attach do VS Code)\n"
+	@printf "  make debug                             # sobe com debugpy em :5678 (attach do VS Code ou PyCharm)\n"
+	@printf "  make pycharm                           # valores para a configuração \"Attach to DAP\" do PyCharm\n"
 	@printf "  make watch MODULE=minha_app            # actualiza o módulo a cada alteração (permanente: AUTO_UPDATE no .env)\n"
 	@printf "\n$(C_DIM)Configuração (versão do Odoo, porta, credenciais, pastas de addons…): edita o .env e corre make up$(C_RESET)\n"
 
@@ -536,13 +537,28 @@ up: guard check-env conf _check-project  ## Sobe o ambiente completo (Odoo + Pos
 	printf "\n$(C_GREEN)✓ ambiente pronto$(C_RESET) → $(C_BOLD)http://localhost:$(ODOO_PORT)$(C_RESET)  (Odoo $(ODOO_VERSION) $(EDITION) · BD: $(DB) · login: admin / admin)\n"
 
 .PHONY: debug
-debug: guard check-env conf ensure-image _check-project  ## Sobe com debugpy à escuta (attach do VS Code, config "Odoo")
+debug: guard check-env conf ensure-image _check-project  ## Sobe com debugpy à escuta (attach do VS Code — config "Odoo" — ou do PyCharm — make pycharm)
 	@printf "$(C_CYAN)→ a subir em modo debug (debugpy em :$(call env,ODOO_DEBUG_PORT), sem auto-reload)$(C_RESET)\n"
 	$(COMPOSE) up -d --wait db
 	ODOO_DEBUG=1 ODOO_DEV=qweb,xml $(COMPOSE) -f $(ROOT_DIR)/docker-compose.debug.yml up -d odoo
 	$(MAKE) --no-print-directory _watch-start
-	printf "$(C_GREEN)✓ debugpy à escuta em :$(call env,ODOO_DEBUG_PORT)$(C_RESET) — attach pelo VS Code (F5, config \"Odoo\")\n"
+	printf "$(C_GREEN)✓ debugpy à escuta em :$(call env,ODOO_DEBUG_PORT)$(C_RESET) — VS Code: F5 com a config \"Odoo\" · PyCharm: configuração \"Attach to DAP\" (make pycharm mostra os valores)\n"
 	printf "$(C_DIM)  nota: o auto-reload fica desligado em debug; make up volta ao modo normal$(C_RESET)\n"
+
+.PHONY: pycharm
+pycharm: check-env  ## Mostra como ligar o PyCharm ao make debug (configuração "Attach to DAP" com os caminhos deste ambiente)
+	@printf "$(C_BOLD)PyCharm → depurar o Odoo que corre no Docker$(C_RESET) $(C_DIM)(PyCharm 2026.1 ou mais recente, que fala com o debugpy)$(C_RESET)\n\n"
+	printf "1. $(C_CYAN)make debug$(C_RESET)  — arranca o Odoo com o debugpy à escuta em localhost:$(call env,ODOO_DEBUG_PORT)\n"
+	printf "2. Em PyCharm: $(C_BOLD)Run → Edit Configurations → + → Attach to DAP$(C_RESET) e preenche:\n"
+	printf "     Name:            Odoo\n"
+	printf "     Remote address:  host $(C_BOLD)localhost$(C_RESET)   port $(C_BOLD)$(call env,ODOO_DEBUG_PORT)$(C_RESET)\n"
+	printf "     Path Mappings (Local Root Path → Remote Root Path), um por linha:\n"
+	for m in $(LAUNCH_MAP); do printf "       %-45s → %s\n" "$${m%%=*}" "$${m#*=}"; done
+	printf "     $(C_DIM)Store as project file (opcional): guarda em .idea/runConfigurations para reutilizar$(C_RESET)\n"
+	printf "3. $(C_BOLD)Debug$(C_RESET) (Shift+F9) com a configuração \"Odoo\" — os breakpoints funcionam em todas as pastas de addons acima.\n"
+	printf "   Para apanhar o próprio arranque do servidor: ODOO_WAIT=1 no .env antes do make debug.\n\n"
+	printf "$(C_DIM)Nota: em versões do PyCharm anteriores à 2026.1 não existe \"Attach to DAP\"; nessas, o ambiente serve na mesma para editar, instalar e actualizar módulos (make install/update, make logs, AUTO_UPDATE), mas a depuração passo a passo não está disponível.$(C_RESET)\n"
+	printf "$(C_DIM)Repositórios em repos/: o PyCharm detecta-os sozinho (Settings → Version Control → Directory Mappings).$(C_RESET)\n"
 
 .PHONY: down
 down: guard init  ## Pára o ambiente (os dados persistem nos volumes)
