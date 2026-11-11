@@ -154,9 +154,9 @@ LAUNCH_MAP = $(ROOT_DIR)/addons=/mnt/extra-addons $(REPOS_DIR)=/mnt/repos \
 FILE       ?=
 MODULE     ?=
 # scaffold: pasta de addons de destino (default: addons/ do repo);
-# pip-add/pip-remove/pip-list: pasta cujo requirements.txt se gere (alternativa a MODULE)
+# lib-add/lib-rm/lib-ls: pasta cujo requirements.txt se gere (alternativa a MODULE)
 IN         ?=
-# pip-add/pip-remove: pacote(s) Python, separados por vírgula (ex.: requests,pkg==1.2)
+# lib-add/lib-rm: biblioteca(s) Python, separadas por vírgula (ex.: requests,pkg==1.2)
 PKG        ?=
 FILESTORE  ?= 1
 NEUTRALIZE ?= 1
@@ -225,7 +225,7 @@ help:  ## Mostra esta ajuda
 	@printf "  make migrate-module MODULE=x TO=18.0   # migra o código do módulo x para a 18.0 (semi-automático)\n"
 	@printf "  make debug                             # sobe com debugpy em :5678 (attach do VS Code)\n"
 	@printf "  make watch MODULE=minha_app            # actualiza o módulo a cada alteração (permanente: AUTO_UPDATE no .env)\n"
-	@printf "  make pip-add PKG=requests MODULE=x     # biblioteca Python no requirements.txt do módulo x, já instalada (pip-remove, pip-list)\n"
+	@printf "  make lib-add PKG=requests MODULE=x     # biblioteca Python no requirements.txt do módulo x, já instalada (lib-rm, lib-ls)\n"
 	@printf "\n$(C_DIM)Configuração (versão do Odoo, porta, credenciais, pastas de addons…): edita o .env e corre make up$(C_RESET)\n"
 
 # ═════════════════════════════════════════════════════════════════════
@@ -793,10 +793,11 @@ update: guard check-env conf  ## Actualiza módulo(s): MODULE=a,b,c ou MODULE=al
 	$(COMPOSE) restart odoo 2>/dev/null && $(MAKE) --no-print-directory _watch-start || true
 	printf "$(C_GREEN)✓ módulo(s) $(MODULE) actualizado(s) na BD $(DB)$(C_RESET)\n"
 
-# ── Dependências Python dos módulos (gestor de bibliotecas) ───────────
-# O requirements.txt alvo é o do módulo (MODULE=<nome>, procurado em todas as
-# pastas de addons) ou o de uma pasta à escolha (IN=<pasta>, ex.: a raiz de
-# um repo em repos/). Shell partilhado pelos três comandos: define DIR e REQ.
+# ── Bibliotecas Python dos módulos: make lib-add / lib-rm / lib-ls ──────────
+# Onde: MODULE=<nome> (requirements.txt do módulo, procurado em todas as
+# pastas de addons) ou IN=<pasta> (o requirements.txt dessa pasta, ex.: a raiz
+# de um repo em repos/). Sem nenhum dos dois: addons/requirements.txt, as
+# bibliotecas gerais do ambiente. Shell partilhado: define DIR e REQ.
 define REQ_TARGET
 	if [ -n "$(IN)" ]; then
 		DIR="$(call addons_abs,$(IN))"
@@ -808,7 +809,7 @@ define REQ_TARGET
 		done
 		test -n "$$DIR" || { printf "$(C_RED)✗ módulo $(MODULE) não encontrado em nenhuma pasta de addons$(C_RESET) $(C_DIM)(make status lista-as)$(C_RESET)\n"; exit 1; }
 	else
-		printf "$(C_RED)✗ indica o módulo (MODULE=<nome>) ou a pasta (IN=<pasta>) cujo requirements.txt queres gerir$(C_RESET)\n"; exit 1
+		DIR="$(ROOT_DIR)/addons"
 	fi
 	REQ="$$DIR/requirements.txt"
 endef
@@ -818,20 +819,25 @@ define PKG_NORM_AWK
 function norm(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]*([=<>!~;@\[ ].*)?$$/, "", s); gsub(/[-_.]+/, "-", s); return tolower(s) }
 endef
 
+# PKG=a,b==1.0 → array bash com uma especificação por elemento (sem espaços)
+define PKG_ARRAY
+	test -n "$(PKG)" || { printf "$(C_RED)✗ falta PKG=<pacote[,pacote…]>$(C_RESET) $(C_DIM)(ex.: PKG=requests ou PKG=xlrd==2.0.1,pyyaml; com > ou < usa aspas: \"PKG=pkg>=1\")$(C_RESET)\n"; exit 1; }
+	test -z "$(word 2,$(PKG))" || { printf "$(C_RED)✗ PKG não pode ter espaços — separa os pacotes por vírgula: PKG=a,b$(C_RESET)\n"; exit 1; }
+	specs=($(foreach s,$(subst $(comma),$(space),$(PKG)),'$(s)'))
+endef
+
 # a correr? (o container odoo existe e está up)
 ODOO_RUNNING = $(COMPOSE) ps --status running odoo 2>/dev/null | grep -q odoo
 
-.PHONY: pip-add
-pip-add: check-env  ## Adiciona pacote(s) Python ao requirements.txt de um módulo e instala-os (PKG=a,b==1.0 MODULE=<m> | IN=<pasta>)
-	@test -n "$(PKG)" || { printf "$(C_RED)✗ uso: make pip-add PKG=<pacote[,pacote…]> MODULE=<módulo>$(C_RESET) $(C_DIM)(ou IN=<pasta>; versões: PKG=requests==2.32.3 ou \"PKG=pkg>=1\")$(C_RESET)\n"; exit 1; }
-	test -z "$(word 2,$(PKG))" || { printf "$(C_RED)✗ PKG não pode ter espaços — separa os pacotes por vírgula: PKG=a,b$(C_RESET)\n"; exit 1; }
+.PHONY: lib-add
+lib-add: check-env  ## Adiciona biblioteca(s) Python e instala-as: PKG=a,b==1.0 [MODULE=<m> | IN=<pasta>] (sem local: addons/requirements.txt)
+	@$(PKG_ARRAY)
 	$(REQ_TARGET)
-	specs=($(foreach s,$(subst $(comma),$(space),$(PKG)),'$(s)'))
 	for spec in "$${specs[@]}"; do
 		echo "$$spec" | grep -qE '^[A-Za-z0-9][A-Za-z0-9._-]*(\[[A-Za-z0-9,._ -]+\])?([=<>!~][^[:space:]]*)?$$' || { printf "$(C_RED)✗ especificação inválida: $$spec$(C_RESET) $(C_DIM)(ex.: requests, requests==2.32.3, pkg[extra]>=1)$(C_RESET)\n"; exit 1; }
 	done
 	if [ ! -f "$$REQ" ]; then
-		printf "# Dependências Python deste módulo — geridas com make pip-add / pip-remove\n" > "$$REQ"
+		printf "# Bibliotecas Python — geridas com make lib-add / make lib-rm\n" > "$$REQ"
 		printf "$(C_GREEN)✓ criado $$REQ$(C_RESET)\n"
 	fi
 	for spec in "$${specs[@]}"; do
@@ -853,33 +859,38 @@ pip-add: check-env  ## Adiciona pacote(s) Python ao requirements.txt de um módu
 		printf "$(C_DIM)  o ambiente não está a correr — instala-se no próximo make up (reconstrói a camada de dependências)$(C_RESET)\n"
 	fi
 
-.PHONY: pip-remove
-pip-remove: check-env  ## Remove pacote(s) do requirements.txt de um módulo e desinstala-os (PKG=a,b MODULE=<m> | IN=<pasta>)
-	@test -n "$(PKG)" || { printf "$(C_RED)✗ uso: make pip-remove PKG=<pacote[,pacote…]> MODULE=<módulo>$(C_RESET) $(C_DIM)(ou IN=<pasta>)$(C_RESET)\n"; exit 1; }
-	test -z "$(word 2,$(PKG))" || { printf "$(C_RED)✗ PKG não pode ter espaços — separa os pacotes por vírgula: PKG=a,b$(C_RESET)\n"; exit 1; }
-	$(REQ_TARGET)
-	[ -f "$$REQ" ] || { printf "$(C_RED)✗ $$DIR não tem requirements.txt$(C_RESET)\n"; exit 1; }
-	names=($(foreach s,$(subst $(comma),$(space),$(PKG)),'$(s)'))
+.PHONY: lib-rm
+lib-rm: check-env  ## Remove biblioteca(s) Python e desinstala-as: PKG=a,b [MODULE=<m> | IN=<pasta>] (sem local: de todos os requirements.txt)
+	@$(PKG_ARRAY)
+	$(MAKE) --no-print-directory init
+	if [ -n "$(IN)$(MODULE)" ]; then
+		$(REQ_TARGET)
+		[ -f "$$REQ" ] || { printf "$(C_RED)✗ $$DIR não tem requirements.txt$(C_RESET)\n"; exit 1; }
+		files="$$REQ"
+	else
+		# sem local: todos os requirements.txt das pastas de módulos
+		files=$$(grep '^# --- ' $(ADDONS_REQ) 2>/dev/null | sed 's/^# --- //')
+	fi
 	to_uninstall=""
-	for name in "$${names[@]}"; do
-		before=$$(wc -l < "$$REQ")
-		awk -v name="$$name" '$(PKG_NORM_AWK)
-			BEGIN { n = norm(name) }
-			!/^[[:space:]]*(#|$$)/ && norm($$0) == n { next }
-			{ print }' "$$REQ" > "$$REQ.tmp" && mv "$$REQ.tmp" "$$REQ"
-		if [ "$$(wc -l < "$$REQ")" = "$$before" ]; then
-			printf "$(C_YELL)! $$name não estava em $$REQ$(C_RESET)\n"; continue
-		fi
-		printf "$(C_GREEN)✓ $$name removido de $$REQ$(C_RESET)\n"
-		to_uninstall="$$to_uninstall $$name"
+	for name in "$${specs[@]}"; do
+		hit=0
+		for f in $$files; do
+			before=$$(wc -l < "$$f")
+			awk -v name="$$name" '$(PKG_NORM_AWK)
+				BEGIN { n = norm(name) }
+				!/^[[:space:]]*(#|$$)/ && norm($$0) == n { next }
+				{ print }' "$$f" > "$$f.tmp" && mv "$$f.tmp" "$$f"
+			if [ "$$(wc -l < "$$f")" != "$$before" ]; then printf "$(C_GREEN)✓ $$name removido de $$f$(C_RESET)\n"; hit=1; fi
+		done
+		if [ $$hit = 1 ]; then to_uninstall="$$to_uninstall $$name"; else printf "$(C_YELL)! $$name não estava em $(if $(IN)$(MODULE),$$files,nenhum requirements.txt dos módulos)$(C_RESET)\n"; fi
 	done
 	$(MAKE) --no-print-directory init
 	# só desinstala o que mais ninguém pede: nem outro requirements.txt de módulos
 	# (config/requirements.addons.txt) nem a própria imagem base (requirements.txt do setup)
-	keep=""; go=""
+	go=""
 	for name in $$to_uninstall; do
 		if awk -v name="$$name" '$(PKG_NORM_AWK) BEGIN { n = norm(name) } !/^[[:space:]]*(#|$$)/ && norm($$0) == n { f = 1 } END { exit !f }' $(ADDONS_REQ); then
-			printf "$(C_DIM)  $$name fica instalado: ainda é pedido por outro requirements.txt (make pip-list)$(C_RESET)\n"
+			printf "$(C_DIM)  $$name fica instalado: ainda é pedido por outro requirements.txt (make lib-ls)$(C_RESET)\n"
 		elif [ -f $(ROOT_DIR)/requirements.txt ] && awk -v name="$$name" '$(PKG_NORM_AWK) BEGIN { n = norm(name) } !/^[[:space:]]*(#|$$)/ && norm($$0) == n { f = 1 } END { exit !f }' $(ROOT_DIR)/requirements.txt; then
 			printf "$(C_DIM)  $$name fica instalado: faz parte da imagem base do setup$(C_RESET)\n"
 		else
@@ -897,8 +908,8 @@ pip-remove: check-env  ## Remove pacote(s) do requirements.txt de um módulo e d
 		fi
 	fi
 
-.PHONY: pip-list
-pip-list: check-env  ## Lista as dependências Python dos módulos e se estão instaladas (todas, ou MODULE=<m> | IN=<pasta>)
+.PHONY: lib-ls
+lib-ls: check-env  ## Lista as bibliotecas Python dos módulos e se estão instaladas (todas, ou MODULE=<m> | IN=<pasta>)
 	@$(MAKE) --no-print-directory init
 	installed=""
 	if $(ODOO_RUNNING); then installed="$$($(COMPOSE) exec -T odoo uv pip freeze --system 2>/dev/null || true)"; fi
@@ -915,10 +926,10 @@ pip-list: check-env  ## Lista as dependências Python dos módulos e se estão i
 	}
 	if [ -n "$(IN)$(MODULE)" ]; then
 		$(REQ_TARGET)
-		[ -f "$$REQ" ] && show "$$REQ" || printf "$(C_DIM)$$DIR não tem requirements.txt (make pip-add PKG=… cria-o)$(C_RESET)\n"
+		[ -f "$$REQ" ] && show "$$REQ" || printf "$(C_DIM)$$DIR não tem requirements.txt (make lib-add PKG=… $(if $(MODULE),MODULE=$(MODULE),IN=$(IN)) cria-o)$(C_RESET)\n"
 	else
 		files=$$(grep '^# --- ' $(ADDONS_REQ) 2>/dev/null | sed 's/^# --- //')
-		[ -n "$$files" ] || printf "$(C_DIM)nenhum requirements.txt encontrado nas pastas de módulos (make pip-add PKG=… MODULE=… cria um)$(C_RESET)\n"
+		[ -n "$$files" ] || printf "$(C_DIM)nenhum requirements.txt nas pastas de módulos (make lib-add PKG=… cria um)$(C_RESET)\n"
 		for f in $$files; do show "$$f"; done
 	fi
 	[ -n "$$installed" ] || printf "$(C_DIM)(ambiente parado: sem informação do que está instalado)$(C_RESET)\n"

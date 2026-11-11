@@ -354,35 +354,44 @@ que não resolver e lista no fim o que ficou de fora. A verificação de
 importação no fim do build continua a garantir que o Odoo arranca. Ainda
 assim, o ideal é cada repo listar só as dependências reais dos módulos.
 
-### Gerir as bibliotecas Python de um módulo
+### Bibliotecas Python: `make lib-add`, `make lib-rm`, `make lib-ls`
 
 Em vez de editares `requirements.txt` à mão e esperares pelo build, o `make`
 faz as duas coisas de uma vez:
 
 ```bash
-make pip-add PKG=requests MODULE=minha_app          # acrescenta e instala
-make pip-add PKG=xlrd==2.0.1,pyyaml MODULE=minha_app  # vários, com versão
-make pip-remove PKG=xlrd MODULE=minha_app            # retira e desinstala
-make pip-list                                        # tudo, com o que está instalado
-make pip-list MODULE=minha_app                       # só um módulo
+make lib-add PKG=requests                     # biblioteca geral do ambiente
+make lib-add PKG=xlrd==2.0.1,pyyaml MODULE=minha_app # no requirements.txt do módulo
+make lib-rm PKG=xlrd                          # retira de onde estiver e desinstala
+make lib-rm PKG=xlrd MODULE=minha_app         # só desse módulo
+make lib-ls                                   # tudo, com o que está instalado
+make lib-ls MODULE=minha_app                  # só um módulo
 ```
 
-- `pip-add` escreve o pacote no `requirements.txt` **do módulo**
-  (`<pasta do módulo>/requirements.txt`, criado se não existir; se o
-  pacote já lá estiver com outra versão, a linha é substituída), regenera
-  `config/requirements.addons.txt` e, se o ambiente estiver a correr,
-  instala-o já no container e reinicia o servidor. O `make up` seguinte
-  grava-o na imagem, por isso fica para sempre e para quem clonar o repo.
-- `pip-remove` faz o inverso. Só desinstala do ambiente se mais nenhum
+Onde cada comando actua:
+
+| | sem `MODULE`/`IN` | `MODULE=<nome>` | `IN=<pasta>` |
+|---|---|---|---|
+| `lib-add` | `addons/requirements.txt` (bibliotecas gerais) | `requirements.txt` do módulo | `requirements.txt` dessa pasta |
+| `lib-rm` | de **todos** os `requirements.txt` que a listem | só do módulo | só dessa pasta |
+| `lib-ls` | todos | só o módulo | só essa pasta |
+
+- `lib-add` escreve o pacote no `requirements.txt` de destino (criado se não
+  existir; se o pacote já lá estiver com outra versão, a linha é
+  substituída), regenera `config/requirements.addons.txt` e, se o ambiente
+  estiver a correr, instala-o já no container e reinicia o servidor. O
+  `make up` seguinte grava-o na imagem, por isso fica para sempre e para
+  quem clonar o repo.
+- `lib-rm` faz o inverso. Só desinstala do ambiente se mais nenhum
   `requirements.txt` pedir o pacote e se ele não fizer parte da imagem base.
-- `pip-list` mostra cada `requirements.txt` encontrado e, com o ambiente a
+- `lib-ls` mostra cada `requirements.txt` encontrado e, com o ambiente a
   correr, a versão instalada de cada pacote ou que ainda falta um `make up`.
 
 O módulo é procurado em todas as pastas de addons (`addons/`, `repos/`,
-`ADDONS_PATHS`). Para gerir o `requirements.txt` de uma pasta em vez do de
-um módulo (por exemplo a raiz de um repo em `repos/`), usa `IN=<pasta>`.
-Especificações com `>` ou `<` precisam de aspas na linha de comando:
-`make pip-add "PKG=pkg>=1.2" MODULE=x`.
+`ADDONS_PATHS`); `IN=<pasta>` serve para o `requirements.txt` de uma pasta
+qualquer, por exemplo a raiz de um repo em `repos/`. Vários pacotes
+separam-se por vírgula; especificações com `>` ou `<` precisam de aspas:
+`make lib-add "PKG=pkg>=1.2"`.
 
 ### Depuração (VS Code)
 
