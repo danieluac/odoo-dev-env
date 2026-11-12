@@ -76,6 +76,11 @@ ENV PIP_BREAK_SYSTEM_PACKAGES=1 PIP_ROOT_USER_ACTION=ignore
 # deps instaladas com uv (rápido e resolução previsível);
 # watchdog: necessário para o auto-reload (--dev=reload);
 # openupgradelib (master, como a OCA recomenda): necessária ao make migrate (OpenUpgrade).
+# odoo_upgrade (odoo/upgrade-util, master — a única versão suportada): os
+# utilitários oficiais de migração da Odoo, importáveis nos scripts de
+# migração dos módulos como `from odoo.upgrade import util`. Instala-se em
+# /usr/local como odoo/upgrade/…, que o odoo.upgrade do Odoo (pkgutil.extend_path)
+# apanha sozinho — não é preciso --upgrade-path.
 #
 # Nota: o uv não considera os pacotes Python que a imagem oficial traz via
 # apt (/usr/lib/python3/dist-packages) — qualquer dependência sem versão
@@ -91,6 +96,7 @@ RUN pip3 install --no-cache-dir uv \
     && uv pip install --system --break-system-packages --no-cache \
         -r /tmp/requirements.txt watchdog lxml-html-clean \
         "openupgradelib @ git+https://github.com/OCA/openupgradelib.git@master" \
+        "odoo_upgrade @ git+https://github.com/odoo/upgrade-util@master" \
     && (uv pip uninstall --system --break-system-packages tzdata || true)
 
 # Todas as versões: o requirements arrasta um cryptography recente, com o

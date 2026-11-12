@@ -23,7 +23,10 @@ import zoneinfo
 
 MODULES = (
     "OpenSSL cryptography urllib3 requests psycopg2 lxml lxml.html.clean "
-    "pandas pyodbc debugpy watchdog odoo odoo.tools.mail odoo.release"
+    "pandas pyodbc debugpy watchdog odoo odoo.tools.mail odoo.release "
+    # ferramentas de migração: openupgradelib (make migrate) e os utilitários
+    # oficiais da Odoo (odoo/upgrade-util → odoo.upgrade.util)
+    "openupgradelib odoo.upgrade.util"
 ).split()
 
 stage = sys.argv[1] if len(sys.argv) > 1 else "imagem"

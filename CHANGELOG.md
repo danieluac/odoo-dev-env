@@ -7,6 +7,11 @@ suportadas. Ver a secção "Releases" do `CONTRIBUTING.md`.
 
 ## Não lançado
 
+- A imagem traz os utilitários oficiais de migração da Odoo
+  ([odoo/upgrade-util](https://github.com/odoo/upgrade-util)), importáveis
+  nos scripts de migração dos módulos como `from odoo.upgrade import util`;
+  a verificação no fim do build confirma que importam. README §9.4 explica
+  como escrever esses scripts. Requer nova release (imagem base).
 - Actualização automática de módulos: `AUTO_UPDATE=a,b` no `.env` faz o
   ambiente observar as pastas desses módulos e correr `odoo -u` sobre a BD
   activa a cada alteração (vistas, dados, traduções, campos novos), sem
