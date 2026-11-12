@@ -503,6 +503,39 @@ PostgreSQL. Requer subscrição Enterprise válida; segue as mensagens do
 script. Para usar a BD devolvida na versão nova: `make backup DB=<nome
 devolvido>` e depois, no ambiente da versão nova, `make restore FILE=…`.
 
+### 9.4 Scripts de migração nos teus módulos
+
+Quando um módulo muda de forma incompatível (campo renomeado, modelo
+fundido, dados a converter), o sítio certo para a conversão é um **script de
+migração** dentro do próprio módulo, que o Odoo corre sozinho no `make
+update` quando a versão do manifesto sobe:
+
+```
+minha_app/
+└── migrations/
+    └── 18.0.1.1.0/          ← a versão nova do manifesto
+        ├── pre-renomear.py  ← antes de carregar o módulo
+        └── post-dados.py    ← depois
+```
+
+Dentro desses scripts tens à disposição os **utilitários oficiais de
+migração da Odoo** ([odoo/upgrade-util](https://github.com/odoo/upgrade-util)),
+que a imagem já traz instalados em todas as versões — os mesmos que a Odoo
+usa no seu serviço de upgrade:
+
+```python
+from odoo.upgrade import util
+
+def migrate(cr, version):
+    util.rename_field(cr, "res.partner", "old_name", "new_name")
+    util.remove_view(cr, "minha_app.vista_antiga")
+```
+
+Documentação: [como escrever scripts de migração](https://www.odoo.com/documentation/master/developer/reference/upgrades/upgrade_scripts.html)
+e a [referência dos utilitários](https://www.odoo.com/documentation/master/developer/reference/upgrades/upgrade_utils.html).
+Os scripts correm também durante o `make migrate` (OpenUpgrade) e no serviço
+oficial, por isso o mesmo código serve para os três caminhos.
+
 ## 10. Variáveis do `.env`
 
 | Variável | Por omissão | Descrição |
