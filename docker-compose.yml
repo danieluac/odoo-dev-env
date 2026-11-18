@@ -40,7 +40,9 @@ services:
         # imagem de partida: a publicada no GHCR (escolhida pelo Makefile) ou
         # "base" = construir tudo localmente a partir da imagem oficial
         BASE_IMAGE: ${BASE_IMAGE_EFFECTIVE:-base}
-    image: odoo-custom:${ODOO_VERSION}
+    # etiqueta por ambiente (odoo-custom:<versão>[-<INSTANCE>]), calculada pelo
+    # Makefile: dois clones da mesma versão têm imagens finais separadas
+    image: ${ODOO_IMAGE:?corre via make (make up) — a etiqueta da imagem é calculada pelo Makefile}
     # --database/--db-filter amarram o servidor à BD activa (ODOO_DB no .env;
     # o make restore/db-use actualizam-na automaticamente).
     # ODOO_DEBUG=1 (via `make debug` ou .env) → arranca sob debugpy à escuta
