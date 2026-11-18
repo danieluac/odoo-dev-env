@@ -12,6 +12,11 @@ suportadas. Ver a secção "Releases" do `CONTRIBUTING.md`.
   nos scripts de migração dos módulos como `from odoo.upgrade import util`;
   a verificação no fim do build confirma que importam. README §9.4 explica
   como escrever esses scripts. Requer nova release (imagem base).
+- PyCharm: `make pycharm` mostra o passo a passo e os valores (endereço e
+  mapeamentos de pastas deste ambiente) para a configuração "Attach to DAP"
+  do PyCharm 2026.1+, que se liga ao `debugpy` do `make debug`; mensagens e
+  documentação de depuração passam a cobrir os dois editores; `.idea/`
+  ignorada pelo git.
 - Bibliotecas Python: `make lib-add PKG=…` escreve o pacote num
   `requirements.txt` (do módulo com `MODULE=`, de uma pasta com `IN=`, ou
   `addons/requirements.txt` sem indicação; criado se faltar) e instala-o já
