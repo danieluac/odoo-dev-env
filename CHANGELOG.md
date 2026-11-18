@@ -17,6 +17,11 @@ suportadas. Ver a secção "Releases" do `CONTRIBUTING.md`.
   `ADDONS_PATHS` passam também a ser descobertos.
 - `make install` e `make update` voltam a arrancar a actualização automática
   depois de reiniciarem o servidor.
+- Correcção: dois clones da mesma versão do Odoo (com `INSTANCE` distinto)
+  partilhavam a etiqueta da imagem final `odoo-custom:<versão>`; o
+  `make restart`, `make debug`, `make install` e `make update` de um podiam
+  usar a imagem construída pelo outro, com bibliotecas Python diferentes. A
+  imagem final passa a ser `odoo-custom:<versão>[-<INSTANCE>]`, por projecto.
 - Actualização automática de módulos: `AUTO_UPDATE=a,b` no `.env` faz o
   ambiente observar as pastas desses módulos e correr `odoo -u` sobre a BD
   activa a cada alteração (vistas, dados, traduções, campos novos), sem

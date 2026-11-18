@@ -460,7 +460,10 @@ O `INSTANCE` dá a cada clone o seu próprio projecto Docker; o `make up`
 confirma que o projecto pertence à pasta actual antes de avançar e, se não
 pertencer, diz o que definir. `make status` mostra o projecto e a pasta a
 que pertence. Os dados são isolados por projecto: o backup/restore de um
-ambiente nunca toca no outro.
+ambiente nunca toca no outro. A imagem final também é por projecto
+(`odoo-custom:<versão>[-<INSTANCE>]`): cada clone leva as bibliotecas Python
+dos seus próprios repositórios de módulos, sem interferir com o outro. Só a
+imagem base, igual para todos, é partilhada.
 
 ## 9. Migrar de versão (ex.: 16 → 17 → 18)
 

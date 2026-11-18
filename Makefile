@@ -181,15 +181,21 @@ endif
 # versão partilhariam o projecto e o `make up` de um recriava os containers do outro.
 INSTANCE = $(call env,INSTANCE)
 PROJECT  = odoo-$(subst .,-,$(ODOO_VERSION))$(if $(INSTANCE),-$(INSTANCE),)
+# imagem final (base + bibliotecas dos repos de módulos deste clone) também
+# por projecto: dois clones da mesma versão com requirements.txt diferentes
+# não podem partilhar a etiqueta, senão o restart/install/debug de um usava
+# a imagem construída pelo outro.
+ODOO_IMAGE = odoo-custom:$(ODOO_VERSION)$(if $(INSTANCE),-$(INSTANCE),)
 COMPOSE_FILES = -f $(ROOT_DIR)/docker-compose.yml \
   $(if $(filter 1,$(call env,PG_TUNING)),-f $(ROOT_DIR)/docker-compose.pg-tuning.yml,) \
   $(if $(ENTERPRISE_DIR),-f $(ROOT_DIR)/docker-compose.enterprise.yml,) \
   $(if $(call env,POSTGRES_PORT),-f $(ROOT_DIR)/docker-compose.db-port.yml,) \
   $(if $(ADDONS_PATHS),-f $(ADDONS_COMPOSE),)
-# ODOO_VERSION/POSTGRES_VERSION passados no ambiente: o compose lê o .env,
-# mas uma variável de ambiente tem precedência — assim o override interno _V
-# e o PostgreSQL derivado da versão chegam ao compose.
-COMPOSE  = ODOO_VERSION=$(ODOO_VERSION) POSTGRES_VERSION=$(POSTGRES_VERSION) docker compose --project-directory $(ROOT_DIR) -p $(PROJECT) $(COMPOSE_FILES)
+# ODOO_VERSION/POSTGRES_VERSION/ODOO_IMAGE passados no ambiente: o compose lê
+# o .env, mas uma variável de ambiente tem precedência — assim o override
+# interno _V, o PostgreSQL derivado da versão e a etiqueta da imagem chegam
+# ao compose.
+COMPOSE  = ODOO_VERSION=$(ODOO_VERSION) POSTGRES_VERSION=$(POSTGRES_VERSION) ODOO_IMAGE=$(ODOO_IMAGE) docker compose --project-directory $(ROOT_DIR) -p $(PROJECT) $(COMPOSE_FILES)
 EXEC_DB  = $(COMPOSE) exec -T db
 PSQL     = $(EXEC_DB) psql -U $(PGUSER)
 # one-off: container descartável do serviço odoo (não mexe no servidor)
@@ -512,18 +518,18 @@ _base-image:
 		echo base
 	fi
 
-# constrói odoo-custom:<versão> a partir da imagem base escolhida
+# constrói a imagem deste ambiente ($(ODOO_IMAGE)) a partir da imagem base escolhida
 .PHONY: build
-build: guard check-env  ## (Re)constrói a imagem Odoo desta versão (faz-se sozinho no make up)
+build: guard check-env  ## (Re)constrói a imagem Odoo deste ambiente (faz-se sozinho no make up)
 	@BASE="$$($(MAKE) --no-print-directory _base-image)"
-	printf "$(C_CYAN)→ a preparar a imagem Odoo $(ODOO_VERSION) $(C_DIM)(base: $$BASE)$(C_RESET)\n"
+	printf "$(C_CYAN)→ a preparar a imagem $(ODOO_IMAGE) $(C_DIM)(base: $$BASE)$(C_RESET)\n"
 	BASE_IMAGE_EFFECTIVE="$$BASE" $(COMPOSE) build odoo
 
-# garante que a imagem odoo-custom:<versão> existe (constrói na 1ª vez)
+# garante que a imagem deste ambiente existe (constrói na 1ª vez)
 .PHONY: ensure-image
 ensure-image: guard check-env
-	@if ! docker image inspect odoo-custom:$(ODOO_VERSION) >/dev/null 2>&1; then
-		printf "$(C_CYAN)→ 1ª utilização da versão $(ODOO_VERSION)$(C_RESET)\n"
+	@if ! docker image inspect $(ODOO_IMAGE) >/dev/null 2>&1; then
+		printf "$(C_CYAN)→ 1ª utilização deste ambiente ($(ODOO_IMAGE))$(C_RESET)\n"
 		$(MAKE) --no-print-directory build
 	fi
 
@@ -607,7 +613,7 @@ status: guard init  ## Estado do ambiente (versão, BD activa, containers)
 	else
 		printf "  $(C_DIM)Auto-update:$(C_RESET) desligada $(C_DIM)(AUTO_UPDATE=a,b no .env para actualizar módulos a cada alteração)$(C_RESET)\n"
 	fi
-	printf "  $(C_DIM)Imagem:$(C_RESET)    odoo-custom:$(ODOO_VERSION) $(C_DIM)(base: $(if $(filter local,$(BASE_IMAGE)),build local a partir da imagem oficial,$(BASE_IMAGE)$(comma) com fallback para build local))$(C_RESET)\n"
+	printf "  $(C_DIM)Imagem:$(C_RESET)    $(ODOO_IMAGE) $(C_DIM)(base: $(if $(filter local,$(BASE_IMAGE)),build local a partir da imagem oficial,$(BASE_IMAGE)$(comma) com fallback para build local))$(C_RESET)\n"
 	printf "  $(C_DIM)Projecto:$(C_RESET)  $(PROJECT) $(C_DIM)(pasta: $(ROOT_DIR))$(C_RESET)\n"
 	printf "  $(C_DIM)BD activa:$(C_RESET) $(call env,ODOO_DB)\n"
 	printf "  $(C_DIM)URL:$(C_RESET)       http://localhost:$(ODOO_PORT)\n"
