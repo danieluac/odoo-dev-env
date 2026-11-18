@@ -421,6 +421,10 @@ addons_path = $(ADDONS_PATH)
 data_dir = /var/lib/odoo
 workers = 0
 max_cron_threads = 1
+# Atrás de um proxy/túnel HTTPS (ngrok): confiar nos cabeçalhos X-Forwarded-*,
+# para o Odoo ver o pedido como https e com o anfitrião certo. Sem isto as páginas
+# do portal (assinatura do KYC) servidas pelo túnel não funcionam devidamente.
+proxy_mode = True
 limit_time_cpu = 3600
 limit_time_real = 3600
 limit_memory_soft = 2147483648
