@@ -311,7 +311,7 @@ repos/
 
 O `make up` (ou `make restart`) descobre automaticamente todas as pastas que
 contêm módulos (pastas com `__manifest__.py` lá dentro) e põe-nas no
-`addons_path`. Abre o setup como raiz do editor: o VS Code detecta cada
+`addons_path`. Abre o setup como raiz do editor: o VS Code (e o PyCharm) detecta cada
 repositório dentro de `repos/` e mostra-os todos no painel *Source Control*
 (configuração incluída em `.vscode/settings.json`).
 
@@ -354,18 +354,82 @@ que não resolver e lista no fim o que ficou de fora. A verificação de
 importação no fim do build continua a garantir que o Odoo arranca. Ainda
 assim, o ideal é cada repo listar só as dependências reais dos módulos.
 
-### Depuração (VS Code)
+### Bibliotecas Python: `make lib-add`, `make lib-rm`, `make lib-ls`
+
+Em vez de editares `requirements.txt` à mão e esperares pelo build, o `make`
+faz as duas coisas de uma vez:
+
+```bash
+make lib-add PKG=requests                     # biblioteca geral do ambiente
+make lib-add PKG=xlrd==2.0.1,pyyaml MODULE=minha_app # no requirements.txt do módulo
+make lib-rm PKG=xlrd                          # retira de onde estiver e desinstala
+make lib-rm PKG=xlrd MODULE=minha_app         # só desse módulo
+make lib-ls                                   # tudo, com o que está instalado
+make lib-ls MODULE=minha_app                  # só um módulo
+```
+
+Onde cada comando actua:
+
+| | sem `MODULE`/`IN` | `MODULE=<nome>` | `IN=<pasta>` |
+|---|---|---|---|
+| `lib-add` | `addons/requirements.txt` (bibliotecas gerais) | `requirements.txt` do módulo | `requirements.txt` dessa pasta |
+| `lib-rm` | de **todos** os `requirements.txt` que a listem | só do módulo | só dessa pasta |
+| `lib-ls` | todos | só o módulo | só essa pasta |
+
+- `lib-add` escreve o pacote no `requirements.txt` de destino (criado se não
+  existir; se o pacote já lá estiver com outra versão, a linha é
+  substituída), regenera `config/requirements.addons.txt` e, se o ambiente
+  estiver a correr, instala-o já no container e reinicia o servidor. O
+  `make up` seguinte grava-o na imagem, por isso fica para sempre e para
+  quem clonar o repo.
+- `lib-rm` faz o inverso. Só desinstala do ambiente se mais nenhum
+  `requirements.txt` pedir o pacote e se ele não fizer parte da imagem base.
+- `lib-ls` mostra cada `requirements.txt` encontrado e, com o ambiente a
+  correr, a versão instalada de cada pacote ou que ainda falta um `make up`.
+
+O módulo é procurado em todas as pastas de addons (`addons/`, `repos/`,
+`ADDONS_PATHS`); `IN=<pasta>` serve para o `requirements.txt` de uma pasta
+qualquer, por exemplo a raiz de um repo em `repos/`. Vários pacotes
+separam-se por vírgula; especificações com `>` ou `<` precisam de aspas:
+`make lib-add "PKG=pkg>=1.2"`.
+
+### Depuração (VS Code e PyCharm)
 
 ```bash
 make debug      # sobe o Odoo sob debugpy, à escuta em ODOO_DEBUG_PORT (5678)
 ```
 
-Depois, no VS Code: `F5` com a configuração **"Odoo"**. O ficheiro
+O servidor fica à espera que um editor se ligue pelo protocolo do
+`debugpy` (Debug Adapter Protocol). Em modo debug o auto-reload fica
+desligado; `make up` volta ao modo normal. Para depurar o próprio arranque
+do servidor, activa `ODOO_WAIT=1` no `.env`.
+
+**VS Code**: `F5` com a configuração **"Odoo"**. O ficheiro
 `.vscode/launch.json` é gerado pelo `make up`/`make conf` com um
 mapeamento por pasta de addons (`addons/`, `repos/` e `ADDONS_PATHS`), por
-isso os breakpoints funcionam em todos os módulos. Em modo debug o
-auto-reload fica desligado; `make up` volta ao modo normal. Para depurar o
-próprio arranque do servidor, activa `ODOO_WAIT=1` no `.env`.
+isso os breakpoints funcionam em todos os módulos.
+
+**PyCharm** (2026.1 ou mais recente): usa a configuração de execução
+**"Attach to DAP"**, que liga o PyCharm a um `debugpy` já a correr, como o
+do `make debug`. Os valores a preencher dependem das tuas pastas de addons,
+por isso o `make` mostra-os:
+
+```bash
+make pycharm
+```
+
+Imprime o passo a passo: *Run → Edit Configurations → + → Attach to DAP*,
+*Remote address* `localhost:5678`, e a lista de *Path Mappings* (pasta local
+→ pasta no container), uma por pasta de addons. Depois é *Debug* com a
+configuração "Odoo". Se marcares *Store as project file*, fica guardada em
+`.idea/runConfigurations` (pasta ignorada pelo git) e não precisas de a
+repetir. O PyCharm detecta sozinho os repositórios clonados em `repos/`
+(*Settings → Version Control → Directory Mappings*).
+
+Em versões do PyCharm anteriores à 2026.1 não há forma de ligar ao
+`debugpy`: o ambiente serve na mesma para editar, instalar e actualizar
+módulos, ver logs e usar a actualização automática, mas a depuração passo a
+passo só está disponível no VS Code.
 
 ### Odoo Enterprise (opcional)
 
@@ -421,7 +485,10 @@ O `INSTANCE` dá a cada clone o seu próprio projecto Docker; o `make up`
 confirma que o projecto pertence à pasta actual antes de avançar e, se não
 pertencer, diz o que definir. `make status` mostra o projecto e a pasta a
 que pertence. Os dados são isolados por projecto: o backup/restore de um
-ambiente nunca toca no outro.
+ambiente nunca toca no outro. A imagem final também é por projecto
+(`odoo-custom:<versão>[-<INSTANCE>]`): cada clone leva as bibliotecas Python
+dos seus próprios repositórios de módulos, sem interferir com o outro. Só a
+imagem base, igual para todos, é partilhada.
 
 ## 9. Migrar de versão (ex.: 16 → 17 → 18)
 
@@ -503,6 +570,39 @@ PostgreSQL. Requer subscrição Enterprise válida; segue as mensagens do
 script. Para usar a BD devolvida na versão nova: `make backup DB=<nome
 devolvido>` e depois, no ambiente da versão nova, `make restore FILE=…`.
 
+### 9.4 Scripts de migração nos teus módulos
+
+Quando um módulo muda de forma incompatível (campo renomeado, modelo
+fundido, dados a converter), o sítio certo para a conversão é um **script de
+migração** dentro do próprio módulo, que o Odoo corre sozinho no `make
+update` quando a versão do manifesto sobe:
+
+```
+minha_app/
+└── migrations/
+    └── 18.0.1.1.0/          ← a versão nova do manifesto
+        ├── pre-renomear.py  ← antes de carregar o módulo
+        └── post-dados.py    ← depois
+```
+
+Dentro desses scripts tens à disposição os **utilitários oficiais de
+migração da Odoo** ([odoo/upgrade-util](https://github.com/odoo/upgrade-util)),
+que a imagem já traz instalados em todas as versões — os mesmos que a Odoo
+usa no seu serviço de upgrade:
+
+```python
+from odoo.upgrade import util
+
+def migrate(cr, version):
+    util.rename_field(cr, "res.partner", "old_name", "new_name")
+    util.remove_view(cr, "minha_app.vista_antiga")
+```
+
+Documentação: [como escrever scripts de migração](https://www.odoo.com/documentation/master/developer/reference/upgrades/upgrade_scripts.html)
+e a [referência dos utilitários](https://www.odoo.com/documentation/master/developer/reference/upgrades/upgrade_utils.html).
+Os scripts correm também durante o `make migrate` (OpenUpgrade) e no serviço
+oficial, por isso o mesmo código serve para os três caminhos.
+
 ## 10. Variáveis do `.env`
 
 | Variável | Por omissão | Descrição |
@@ -520,7 +620,7 @@ devolvido>` e depois, no ambiente da versão nova, `make restore FILE=…`.
 | `ODOO_DEV` | `reload,qweb,xml` | Modos dev do Odoo (`none` desactiva) |
 | `ODOO_DEMO` | `0` | `1` = BDs novas e `make install` com dados de demonstração (§7) |
 | `AUTO_UPDATE` | vazio | Módulos (separados por vírgula) actualizados automaticamente a cada alteração nos seus ficheiros (§7) |
-| `ODOO_DEBUG` / `ODOO_WAIT` | — | Debug permanente / esperar pelo VS Code antes de arrancar |
+| `ODOO_DEBUG` / `ODOO_WAIT` | — | Debug permanente / esperar que o editor (VS Code ou PyCharm) se ligue antes de arrancar |
 | `ENTERPRISE_DIR` | vazio | Caminho dos addons Enterprise fora do setup (em `repos/` são detectados sozinhos); com Enterprise presente as BDs novas nascem em modo Enterprise (§7) |
 | `ADDONS_PATHS` | vazio | Pastas de addons fora do setup, separadas por vírgula (§7); alternativa sem configuração: pasta `repos/` |
 | `ADDONS_REQUIREMENTS_IGNORE` | vazio | Pacotes a não instalar dos `requirements.txt` dos repos de módulos (§7) |
