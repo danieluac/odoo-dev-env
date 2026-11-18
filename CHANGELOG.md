@@ -7,6 +7,16 @@ suportadas. Ver a secção "Releases" do `CONTRIBUTING.md`.
 
 ## Não lançado
 
+- Bibliotecas Python: `make lib-add PKG=…` escreve o pacote num
+  `requirements.txt` (do módulo com `MODULE=`, de uma pasta com `IN=`, ou
+  `addons/requirements.txt` sem indicação; criado se faltar) e instala-o já
+  no ambiente; `make lib-rm PKG=…` retira (do local indicado, ou de todos os
+  `requirements.txt` que o listem) e desinstala, excepto se outro ficheiro o
+  pedir ou fizer parte da imagem base; `make lib-ls` mostra os ficheiros e o
+  que está instalado. Os `requirements.txt` dentro dos módulos das pastas de
+  `ADDONS_PATHS` passam também a ser descobertos.
+- `make install` e `make update` voltam a arrancar a actualização automática
+  depois de reiniciarem o servidor.
 - Correcção: dois clones da mesma versão do Odoo (com `INSTANCE` distinto)
   partilhavam a etiqueta da imagem final `odoo-custom:<versão>`; o
   `make restart`, `make debug`, `make install` e `make update` de um podiam
