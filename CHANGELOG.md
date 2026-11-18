@@ -12,6 +12,11 @@ suportadas. Ver a secção "Releases" do `CONTRIBUTING.md`.
   do PyCharm 2026.1+, que se liga ao `debugpy` do `make debug`; mensagens e
   documentação de depuração passam a cobrir os dois editores; `.idea/`
   ignorada pelo git.
+- Correcção: dois clones da mesma versão do Odoo (com `INSTANCE` distinto)
+  partilhavam a etiqueta da imagem final `odoo-custom:<versão>`; o
+  `make restart`, `make debug`, `make install` e `make update` de um podiam
+  usar a imagem construída pelo outro, com bibliotecas Python diferentes. A
+  imagem final passa a ser `odoo-custom:<versão>[-<INSTANCE>]`, por projecto.
 - Actualização automática de módulos: `AUTO_UPDATE=a,b` no `.env` faz o
   ambiente observar as pastas desses módulos e correr `odoo -u` sobre a BD
   activa a cada alteração (vistas, dados, traduções, campos novos), sem
