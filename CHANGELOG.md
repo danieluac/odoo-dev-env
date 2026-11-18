@@ -7,6 +7,11 @@ suportadas. Ver a secção "Releases" do `CONTRIBUTING.md`.
 
 ## Não lançado
 
+- PyCharm: `make pycharm` mostra o passo a passo e os valores (endereço e
+  mapeamentos de pastas deste ambiente) para a configuração "Attach to DAP"
+  do PyCharm 2026.1+, que se liga ao `debugpy` do `make debug`; mensagens e
+  documentação de depuração passam a cobrir os dois editores; `.idea/`
+  ignorada pelo git.
 - Bibliotecas Python: `make lib-add PKG=…` escreve o pacote num
   `requirements.txt` (do módulo com `MODULE=`, de uma pasta com `IN=`, ou
   `addons/requirements.txt` sem indicação; criado se faltar) e instala-o já
